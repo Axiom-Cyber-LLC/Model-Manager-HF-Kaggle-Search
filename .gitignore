@@ -1,0 +1,46 @@
+# Local environments and caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+
+# Generated reports, logs, local notes, and archives
+scan-results/
+*.log
+*.tmp
+chat_export_*.md
+*.zip
+
+# Local scanner checkouts and build outputs
+modelaudit/
+modelscan/
+model-scan/
+ModelGuard/
+palisade-scan/
+skillcheck/
+skill-scanner/
+bin/
+build/
+dist/
+*.egg-info/
+
+# Downloaded model artifacts
+*.gguf
+*.ggml
+*.safetensors
+*.onnx
+*.tflite
+*.mlmodel
+*.mlpackage/
+*.pt
+*.pth
+*.ckpt
+*.pkl
+*.pickle
+*.joblib
+*.bin
