@@ -1,0 +1,11 @@
+# Core dependencies for the root model_tools scripts.
+# Scanner repositories keep their own environments and dependencies.
+
+datasets>=2.20.0
+huggingface_hub[hf_xet]>=0.23.0
+kaggle>=1.6.0
+kagglehub>=0.3.0
+openpyxl>=3.1.0
+pandas>=2.0.0
+pyarrow>=15.0.0
+safetensors>=0.4.0

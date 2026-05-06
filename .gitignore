@@ -15,6 +15,7 @@ scan-results/
 *.tmp
 chat_export_*.md
 *.zip
+*.xlsx
 
 # Local scanner checkouts and build outputs
 modelaudit/
