@@ -119,3 +119,468 @@ This README is not legal advice. Review upstream licenses before distributing sc
 - Destructive cleanup is not automatic; delete prompts are only offered after high-risk findings.
 - Do not load, unpickle, or execute untrusted model files manually while investigating scanner output.
 - A clean scanner result is not a guarantee of safety. Treat scanner results as part of a broader review process.
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                               modelmgr                                      │
+│                                                                             │
+│  ~/bin/modelmgr                                                             │
+│      └── python3 /Users/bowmanbt/model_tools/model_manager.py               │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              Main Menu                                      │
+│                                                                             │
+│  1. Search / download                                                       │
+│  2. Local audit / repair                                                    │
+│  3. Leaderboards                                                            │
+│  4. Conversion workflow                                                     │
+│  5. Prepare models for apps                                                 │
+│  6. Quit                                                                    │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         1. Search / Download                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Artifact Type Picker                                │
+│                                                                             │
+│  Default selected:                                                          │
+│    [x] GGUF                                                                 │
+│    [x] Core ML: .mlmodel / .mlpackage                                       │
+│                                                                             │
+│  Optional only when explicitly selected:                                    │
+│    [ ] MLX                                                                  │
+│    [ ] ONNX                                                                 │
+│    [ ] Safetensors                                                          │
+│    [ ] Keras / TensorFlow                                                   │
+│    [ ] Raw PyTorch / pickle-risk formats                                    │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Search Query Layer                                  │
+│                                                                             │
+│  Examples:                                                                  │
+│    code                                                                     │
+│    code NOT bartowski                                                       │
+│    code NOT --owner:bartowski                                               │
+│    code -owner:bartowski -owner:unsloth                                     │
+│                                                                             │
+│  Filters split into:                                                        │
+│    - owner / publisher excludes                                             │
+│    - model family excludes                                                  │
+│    - repo/name text excludes                                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Provider Search                                     │
+│                                                                             │
+│  Hugging Face                                                               │
+│    - model search                                                           │
+│    - filename search: .gguf, .mlmodel, .mlpackage                           │
+│    - repo metadata fetch                                                    │
+│    - sibling file discovery                                                 │
+│                                                                             │
+│  Kaggle                                                                     │
+│    - best-effort model/dataset search                                       │
+│    - marked as artifact-unconfirmed when file metadata is unavailable       │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Result Filtering                                    │
+│                                                                             │
+│  1. Remove excluded owners/publishers                                       │
+│  2. Remove excluded repo/name text                                          │
+│  3. Remove unsupported artifact types                                       │
+│  4. Group into model families                                               │
+│  5. Let user exclude entire model families                                  │
+│                                                                             │
+│  Example family excludes:                                                   │
+│    qwen coder                                                               │
+│    qwen                                                                     │
+│    deepseek coder                                                           │
+│    mradermacher                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Result / Artifact Picker                            │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  Repo row                                                                   │
+│                                                                             │
+│    1. unsloth/Qwen3-Coder-Next-GGUF                                         │
+│                                                                             │
+│  Artifact rows                                                              │
+│                                                                             │
+│    1A. Qwen3-Coder-Next-Q4_K_M.gguf                                         │
+│    1B. Qwen3-Coder-Next-Q5_K_M.gguf                                         │
+│    1C. Qwen3-Coder-Next-Q8_0.gguf                                          │
+│                                                                             │
+│  Preferred behavior:                                                        │
+│    - selecting 1 opens artifact picker                                      │
+│    - selecting 1A adds artifact to cart                                     │
+│    - whole repo requires explicit command: whole 1                          │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              Selection Cart                                 │
+│                                                                             │
+│  Commands:                                                                  │
+│    1A,2C          add direct artifacts                                      │
+│    1              open artifacts for repo 1                                 │
+│    whole 1        force whole-repo selection                                │
+│    xpub qwen      exclude publisher/owner                                   │
+│    xfam qwen      exclude family                                            │
+│    cart           show selected items                                       │
+│    remove 2       remove item from cart                                     │
+│    clear          empty cart                                                │
+│    n / p          next / previous page                                      │
+│    done           start download                                            │
+│    q              quit selection                                            │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           Download Root                                     │
+│                                                                             │
+│  /Volumes/SamsungSSDE/models                                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           Staging Area                                      │
+│                                                                             │
+│  /Volumes/SamsungSSDE/models/.incoming                                      │
+│                                                                             │
+│  Purpose:                                                                   │
+│    - stream model files directly to disk                                    │
+│    - avoid holding multi-GB files in RAM                                    │
+│    - isolate partial/incomplete/risky downloads                             │
+│    - scan before final install                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           Final Layout                                      │
+│                                                                             │
+│  Hugging Face models:                                                       │
+│    /Volumes/SamsungSSDE/models/huggingface/model/<owner>__<repo>/           │
+│                                                                             │
+│  Hugging Face datasets:                                                     │
+│    /Volumes/SamsungSSDE/models/huggingface/dataset/<owner>__<dataset>/      │
+│                                                                             │
+│  Kaggle models:                                                             │
+│    /Volumes/SamsungSSDE/models/kaggle/model/<owner>__<model>/               │
+│                                                                             │
+│  Kaggle datasets:                                                           │
+│    /Volumes/SamsungSSDE/models/kaggle/dataset/<owner>__<dataset>/           │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌───────────────┐
+│ User selects  │
+│ artifacts     │
+└───────┬───────┘
+        ▼
+┌────────────────────────────────────────────────────┐
+│ Stream download to .incoming                       │
+│                                                    │
+│ Never:                                             │
+│   - load full model into memory                    │
+│   - capture binary output into shell variables     │
+│   - capture huge scanner output into RAM           │
+└───────┬────────────────────────────────────────────┘
+        ▼
+┌────────────────────────────────────────────────────┐
+│ Built-in staged audit                              │
+│                                                    │
+│ Checks:                                            │
+│   - GGUF magic/header                              │
+│   - missing split shards                           │
+│   - LFS pointer files                              │
+│   - suspicious tiny files                          │
+│   - risky scripts/code                             │
+│   - pickle/PyTorch risk files                      │
+└───────┬────────────────────────────────────────────┘
+        ▼
+┌────────────────────────────────────────────────────┐
+│ External scanners, staged path only                │
+│                                                    │
+│ Do not scan all model roots after every download.  │
+└───────┬────────────────────────────────────────────┘
+        ▼
+┌───────────────────────────────┬───────────────────────────────┐
+│ PASS                          │ WARN / HIGH / BLOCKER         │
+│                               │                               │
+│ move from .incoming           │ ask:                          │
+│ to final model path           │   - delete staged download    │
+│                               │   - quarantine staged download│
+│                               │   - keep staged download      │
+│                               │   - continue anyway           │
+└───────────────────────────────┴───────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Safety Stack                                        │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  1. Pre-download checks                                                     │
+│                                                                             │
+│  - owner / publisher reputation                                             │
+│  - known-good author = INFO only                                            │
+│  - suspicious repo names                                                    │
+│  - selected artifact type risk                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  2. Built-in model integrity checks                                         │
+│                                                                             │
+│  - GGUF header validation                                                   │
+│  - GGUF shard completeness                                                  │
+│  - LFS pointer detection                                                    │
+│  - tiny file detection                                                      │
+│  - missing safetensors shards                                               │
+│  - risky extension detection                                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  3. model_audit.py                                                          │
+│                                                                             │
+│  Local model hygiene:                                                       │
+│    - duplicate models                                                       │
+│    - dangling symlinks                                                      │
+│    - corrupt GGUFs                                                          │
+│    - orphan shards                                                          │
+│    - stale app links                                                        │
+│                                                                             │
+│  Important behavior:                                                        │
+│    dangling symlink → rebuild symlink first, not delete model               │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  4. External scanners                                                       │
+│                                                                             │
+│  ModelAudit                                                                 │
+│    - unsafe deserialization                                                 │
+│    - suspicious code                                                        │
+│    - secrets                                                                │
+│    - network indicators                                                     │
+│    - CVE patterns                                                           │
+│                                                                             │
+│  modelscan                                                                  │
+│    - independent model-file scan                                            │
+│                                                                             │
+│  skill-scanner                                                              │
+│    - README / skill-like content findings                                   │
+│    - must be interpreted carefully                                          │
+│                                                                             │
+│  Microsoft Defender                                                         │
+│    - AV/malware/exploit correlation                                         │
+│    - only meaningful if alert path matches model path                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌──────────────┬──────────────────────────────────────────────────────────────┐
+│ Severity     │ Expected behavior                                            │
+├──────────────┼──────────────────────────────────────────────────────────────┤
+│ INFO         │ display only                                                 │
+│ LOW          │ display, no blocking                                         │
+│ WARN         │ ask/review, no delete prompt by default                      │
+│ MEDIUM       │ review recommended                                           │
+│ HIGH         │ review strongly; do not auto-delete unless clearly relevant  │
+│ DANGER       │ deletion/quarantine prompt allowed                           │
+│ BLOCKER      │ block install unless user overrides                          │
+│ CRITICAL     │ block install; delete/quarantine recommended                 │
+└──────────────┴──────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           Local Audit                                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  Scan known model roots                                                     │
+│                                                                             │
+│  /Volumes/SamsungSSDE/models                                                │
+│  /Volumes/SamsungSSDE/models-flat                                           │
+│  /Volumes/SamsungSSDE/models/huggingface/model                              │
+│  /Volumes/SamsungSSDE/models-flat/local                                     │
+│  /Users/bowmanbt/Library/Application Support/nomic.ai/GPT4All               │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  Findings                                                                   │
+│                                                                             │
+│  Dangling symlink                                                           │
+│    ├─ search model roots for same filename                                  │
+│    ├─ if found: rebuild symlink                                             │
+│    └─ if not found: delete broken link only                                 │
+│                                                                             │
+│  Broken model                                                               │
+│    ├─ missing GGUF shards                                                   │
+│    ├─ invalid GGUF header                                                   │
+│    ├─ LFS pointer instead of model                                          │
+│    └─ suspicious tiny artifact                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Conversion Workflow                                 │
+│                                                                             │
+│  /Users/bowmanbt/model_tools/model_conversion.py                            │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  Safetensors discovery                                                      │
+│                                                                             │
+│  Finds candidate HF-style folders containing safetensors.                   │
+│                                                                             │
+│  Important: safetensors are not default search targets.                     │
+│  Conversion is explicit only.                                               │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  User chooses candidates                                                    │
+│                                                                             │
+│    0 / all                                                                  │
+│    3                                                                        │
+│    1,3                                                                      │
+│    2-4                                                                      │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  convert_hf_to_gguf.py                                                      │
+│  llama-quantize                                                             │
+│  gguf Python module                                                         │
+│                                                                             │
+│  Verified interpreter:                                                      │
+│    /opt/homebrew/opt/python@3.14/bin/python3.14                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                       Prepare Models for Apps                               │
+│                                                                             │
+│  /Users/bowmanbt/model_tools/Prepare_models_for_All.py                      │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  Per-app scripts                                                            │
+│                                                                             │
+│  Prepare_models_for_Lmstudio.py                                             │
+│  Prepare_models_for_Ollama.py                                               │
+│  Prepare_models_for_AnythingLLM.py                                          │
+│  Prepare_models_for_GPT4All.py                                              │
+│  Prepare_models_for_Jan.py                                                  │
+│  Prepare_models_for_AINavigator.py                                          │
+│  Prepare_models_for_AIStudio.py                                             │
+│  Prepare_models_for_LocallyAI.py                                            │
+│  Prepare_models_for_LocalAI.py                                              │
+│  Prepare_models_for_Apollo.py                                               │
+│  Prepare_models_for_OffGrid.py                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  App integration behavior                                                   │
+│                                                                             │
+│  Preferred:                                                                 │
+│    - symlink GGUFs                                                          │
+│    - write app-specific config references                                   │
+│    - rebuild broken links                                                   │
+│                                                                             │
+│  Avoid:                                                                     │
+│    - copying huge model files into every app folder                         │
+│    - deleting app/model data because of one stale symlink                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌──────────────┐
+│ modelmgr     │
+└──────┬───────┘
+       ▼
+┌─────────────────────┐
+│ Search/download     │
+└──────┬──────────────┘
+       ▼
+┌─────────────────────┐
+│ Pick artifact types │
+│ default: GGUF/CoreML│
+└──────┬──────────────┘
+       ▼
+┌─────────────────────┐
+│ Search HF/Kaggle    │
+│ filename-aware      │
+└──────┬──────────────┘
+       ▼
+┌─────────────────────┐
+│ Apply NOT filters   │
+│ owner/family/name   │
+└──────┬──────────────┘
+       ▼
+┌─────────────────────┐
+│ Artifact picker     │
+│ 1A / 1B / 2C        │
+└──────┬──────────────┘
+       ▼
+┌─────────────────────┐
+│ Selection cart      │
+│ download on done    │
+└──────┬──────────────┘
+       ▼
+┌─────────────────────┐
+│ Stream to .incoming │
+│ no big memory use   │
+└──────┬──────────────┘
+       ▼
+┌─────────────────────┐
+│ Scan staged path    │
+│ not all roots       │
+└──────┬──────────────┘
+       ▼
+┌──────────────┬────────────────┐
+│ Clean        │ Risk/warning   │
+│              │                │
+│ move final   │ ask remediation│
+└──────┬───────┴────────────────┘
+       ▼
+┌─────────────────────┐
+│ Prepare app links   │
+│ optional            │
+└──────┬──────────────┘
+       ▼
+┌─────────────────────┐
+│ Local audit/repair  │
+│ periodic hygiene    │
+└─────────────────────┘
+
+Design summary
+
+The updated framework should treat Model Manager as a defensive model intake and operations console.
+
+It should not be just a downloader.
+
+It should:
+
+1. Search only useful model types by default.
+2. Prefer direct artifacts over whole repositories.
+3. Let you exclude publishers, families, and repo-name terms clearly.
+4. Keep a selection cart until you type done.
+5. Stream downloads to disk, not memory.
+6. Stage downloads before final install.
+7. Scan only the staged path after download.
+8. Move clean files into /Volumes/SamsungSSDE/models.
+9. Repair app symlinks instead of deleting model data.
+10. Keep conversion and app prep modular.
+11. Separate model safety alerts from unrelated Defender/FileProvider/security-research noise.
