@@ -26,6 +26,8 @@ modelmgr --gui
 
 The GUI includes tabs for the full `modelmgr` menu, guided search/download options, direct Hugging Face downloads, local audit/prep/conversion, and leaderboards. It exposes search source, artifact type, model size, author/tag/family exclusions, duplicate handling, result batching, direct downloader filters/excludes/endpoint/concurrency, audit dry-run mode, prepare-app filters, conversion quant/workers/selection, and leaderboard cache controls. Prompt-heavy flows open in Terminal so result selection, artifact picking, scanner prompts, delete confirmations, prep, and conversion stay visible. The direct Hugging Face downloader panel stays inside the native GUI.
 
+See [System Overview](docs/system-overview.md) for a diagram of the search, download, scan, prepare, and conversion flow.
+
 Optional environment variables:
 
 ```bash
