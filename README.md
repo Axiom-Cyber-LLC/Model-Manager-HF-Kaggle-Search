@@ -10,6 +10,19 @@ This public repository was rebuilt from a sanitized export. Do not commit local 
 
 ## Recent changes
 
+### 2026-05-08 (later still)
+
+**`Prepare_models_for_Lmstudio.py`**
+- New: **`--migrate-underscore-flat`** (default on) — finds `<owner>__<repo>/` directories under `HF_CACHE_DIRS` (the install layout `model_manager.py` uses for non-cache snapshot downloads) and hardlinks files into `<lmstudio_dir>/<owner>/<repo>/`. Closes the gap where freshly-downloaded models landed in a layout LM Studio's downloadsFolder scanner did not recognize, leaving them invisible despite being on disk. Use `--no-migrate-underscore-flat` to skip. Hardlinks on same volume → instant, zero extra disk.
+
+The prep script now runs three migrations by default, each handling one of the layouts a downloaded model can be in:
+
+| Source layout | Migration step |
+|---|---|
+| `models--owner--repo/snapshots/<rev>/` (HF hub cache) | `--migrate-hf-cache` |
+| `<owner>__<repo>/<files>` (model_manager flat install) | `--migrate-underscore-flat` |
+| `<owner>/<repo>/<files>` (already publisher/repo) | `--mirror-models-flat` |
+
 ### 2026-05-08 (later)
 
 **`model_manager.py`**

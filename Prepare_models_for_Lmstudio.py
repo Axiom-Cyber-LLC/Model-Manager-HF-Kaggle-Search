@@ -1414,6 +1414,160 @@ def migrate_hf_cache_dirs(lmstudio_dir: Path, dry_run: bool, cleanup: bool, resu
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Underscore-flat (model_manager.py install layout) → LM Studio
+#
+# model_manager.py's snapshot_download path installs into
+#   <download_root>/huggingface/model/<owner>__<repo>/<files>
+# Note the DOUBLE UNDERSCORE separator. LM Studio expects publisher/repo/
+# layout, so this migration translates each `<owner>__<repo>/` dir back
+# into `<lmstudio_dir>/<owner>/<repo>/` via hardlinks.
+# ──────────────────────────────────────────────────────────────────────
+
+
+def migrate_underscore_flat_dirs(
+    lmstudio_dir: Path,
+    dry_run: bool,
+    results: Results,
+) -> None:
+    """
+    Walk every HF cache root for `<owner>__<repo>/` directories
+    (model_manager.py's flat install layout) and hardlink their files into
+    `<lmstudio_dir>/<owner>/<repo>/`. Same idempotency / hardlink-vs-copy
+    rules as migrate_hf_cache_dirs.
+    """
+    if not lmstudio_dir.exists():
+        try:
+            lmstudio_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return
+
+    try:
+        dest_dev = lmstudio_dir.stat().st_dev
+    except OSError:
+        dest_dev = None
+
+    seen_root_real: set[Path] = set()
+    seen_repo_real: set[Path] = set()
+
+    for cache_root in HF_CACHE_DIRS:
+        if not cache_root.is_dir():
+            continue
+        try:
+            real_root = cache_root.resolve()
+        except (OSError, RuntimeError):
+            real_root = cache_root
+        if real_root in seen_root_real:
+            continue
+        seen_root_real.add(real_root)
+
+        try:
+            entries = sorted(cache_root.iterdir())
+        except OSError:
+            continue
+
+        for entry in entries:
+            if not entry.is_dir() or entry.is_symlink():
+                continue
+            name = entry.name
+            # Skip HF hub cache style (handled by migrate_hf_cache_dirs)
+            if name.startswith("models--") or name.startswith("datasets--"):
+                continue
+            # Need the double-underscore separator
+            if "__" not in name:
+                continue
+            parts = name.split("__", 1)
+            if len(parts) != 2 or not parts[0] or not parts[1]:
+                continue
+            owner, repo = parts
+
+            try:
+                real_repo = entry.resolve()
+            except (OSError, RuntimeError):
+                real_repo = entry
+            if real_repo in seen_repo_real:
+                continue
+            seen_repo_real.add(real_repo)
+
+            try:
+                files = [f for f in entry.iterdir()
+                         if (f.is_file() or f.is_symlink()) and not f.name.startswith(".")]
+            except OSError:
+                continue
+            if not files:
+                continue
+
+            # Skip if the source has only README/companion files (no weights)
+            if not any(f.suffix in ALL_MODEL_EXTENSIONS for f in files):
+                continue
+
+            display = f"{owner}/{repo}"
+            dest_repo = lmstudio_dir / owner / repo
+
+            # Idempotency: same files at same sizes already in destination
+            if dest_repo.is_dir():
+                try:
+                    existing = {f.name: f.stat().st_size
+                                for f in dest_repo.iterdir() if f.is_file()}
+                except OSError:
+                    existing = {}
+                src_sizes: dict[str, int] = {}
+                for f in files:
+                    try:
+                        src_sizes[f.name] = f.resolve().stat().st_size
+                    except OSError:
+                        pass
+                if src_sizes and all(existing.get(n) == sz for n, sz in src_sizes.items()):
+                    continue
+
+            try:
+                src_dev = entry.stat().st_dev
+                can_hardlink = dest_dev is not None and src_dev == dest_dev
+            except OSError:
+                can_hardlink = False
+
+            method = "HARDLINK" if can_hardlink else "COPY"
+            total_size = 0
+            for f in files:
+                try:
+                    total_size += f.resolve().stat().st_size
+                except OSError:
+                    pass
+
+            print(
+                f"  UNDERSCORE-MIGRATE  {name}/  -> {dest_repo}  "
+                f"({len(files)} files, {format_size(total_size)}, {method})"
+            )
+
+            if dry_run:
+                results.fixed.append((display, entry, dest_repo))
+                continue
+
+            try:
+                dest_repo.mkdir(parents=True, exist_ok=True)
+                for src in files:
+                    dst = dest_repo / src.name
+                    if dst.exists():
+                        continue
+                    try:
+                        real_src = src.resolve()
+                        if not real_src.is_file():
+                            continue
+                    except OSError:
+                        continue
+                    if can_hardlink:
+                        try:
+                            os.link(real_src, dst)
+                        except OSError:
+                            shutil.copy2(real_src, dst)
+                    else:
+                        shutil.copy2(real_src, dst)
+                results.fixed.append((display, entry, dest_repo))
+            except OSError as e:
+                print(f"          ERROR: {e}")
+                results.errors.append((display, f"underscore-flat migrate failed: {e}"))
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Models-flat → LM Studio mirror
 #
 # `models_dir` (default: models-flat) is the manager's view, but LM Studio
@@ -2470,6 +2624,12 @@ def main():
              "Use --no-mirror-models-flat to skip.",
     )
     parser.add_argument(
+        "--migrate-underscore-flat", action=argparse.BooleanOptionalAction, default=True,
+        help="Find <owner>__<repo>/ dirs (model_manager.py's flat install layout) under "
+             "HF_CACHE_DIRS and hardlink files into --lmstudio-dir/<owner>/<repo>/. "
+             "Default: enabled. Use --no-migrate-underscore-flat to skip.",
+    )
+    parser.add_argument(
         "--lmstudio-dir", type=Path, default=DEFAULT_LMSTUDIO_DIR,
         help=f"Destination root for HF-cache migration (LM Studio's downloadsFolder). "
              f"Default: {DEFAULT_LMSTUDIO_DIR}",
@@ -2592,6 +2752,11 @@ def main():
         lmstudio_dir = args.lmstudio_dir.expanduser().resolve()
         print(f"Migrating HuggingFace cache dirs into {lmstudio_dir}...")
         migrate_hf_cache_dirs(lmstudio_dir, args.dry_run, args.cleanup_hf_source, results)
+
+    if args.migrate_underscore_flat:
+        lmstudio_dir = args.lmstudio_dir.expanduser().resolve()
+        print(f"Migrating <owner>__<repo>/ flat dirs into {lmstudio_dir}...")
+        migrate_underscore_flat_dirs(lmstudio_dir, args.dry_run, results)
 
     if args.mirror_models_flat:
         lmstudio_dir = args.lmstudio_dir.expanduser().resolve()
