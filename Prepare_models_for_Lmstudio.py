@@ -34,6 +34,8 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from prepare_models_env import default_manager_models_dir, extend_scan_roots
+
 _print_lock = threading.Lock()
 def _tlog(msg):
     """Thread-safe print."""
@@ -78,28 +80,45 @@ KNOWN_PUBLISHERS = {
 # pseudo-publisher holding all short-named models.
 INTERNAL_DIRS = {"blobs", "manifests", "src", "Reference", "paper", ".git"}
 
-DEFAULT_MODELS_DIR = Path("/Volumes/ModelStorage/models-flat")
+DEFAULT_MODELS_DIR = default_manager_models_dir(Path("<Your Model Directory>"))
 
 # All HF/ModelScope cache locations the user has on disk. scan_hf_cache iterates
 # this list; previously it scanned only the first (most other tools' caches
 # were silently invisible). Deduped in scan_hf_cache by resolved real path so
-# the symlink between ~/.cache/huggingface and /Volumes/ModelStorage/.cache
+# the symlink between <REDACTED_PATH> and <REDACTED_PATH>
 # doesn't cause double-scanning.
-HF_CACHE_DIRS = [
-    Path("/Volumes/ModelStorage/.cache/huggingface/hub"),  # primary (HF_HUB_CACHE)
-    Path("/Volumes/ModelStorage/models/huggingface/hub"),  # secondary cache
-    Path("/Volumes/ModelStorage/models/huggingface/model"),
+HF_CACHE_DIRS = extend_scan_roots([
+    Path("<Your Model Directory>"),  # primary (HF_HUB_CACHE)
+    Path("<Your Model Directory>/huggingface/hub"),  # secondary cache
+    Path("<Your Model Directory>/huggingface/model"),
     Path.home() / ".cache" / "huggingface" / "hub",       # symlink fallback
-    Path("/Volumes/ModelStorage/.cache/modelscope"),       # ModelScope cache
-    Path("/Volumes/ModelStorage/.cache/model_manager"),
+    Path("<Your Model Directory>"),       # ModelScope cache
+    Path("<REDACTED_PATH>"),
     Path.home() / "model_downloads" / "huggingface" / "model",
     Path.home() / "Library" / "Application Support" / "nomic.ai" / "GPT4All",
-    Path("~/skill-scanner/scan-results/20260503T074319Z"),
-    Path("~/skill-scanner/scan-results/20260503T074334Z"),
-]
+    Path("<REDACTED_PATH>"),
+    Path("<REDACTED_PATH>"),
+])
 # Backward-compat alias — kept for code paths that referenced the singular name.
 HF_CACHE_DIR = HF_CACHE_DIRS[0]
 OLLAMA_STATE_FILE = Path.home() / ".ollama" / "models" / "model_state.json"
+
+
+def _detect_lmstudio_downloads_folder() -> Path:
+    """Read LM Studio's downloadsFolder setting; fall back to <Your Model Directory>."""
+    settings_path = Path.home() / ".lmstudio" / "settings.json"
+    fallback = Path("<Your Model Directory>")
+    try:
+        data = json.loads(settings_path.read_text())
+        folder = data.get("downloadsFolder")
+        if folder:
+            return Path(folder).expanduser().resolve()
+    except (OSError, json.JSONDecodeError):
+        pass
+    return fallback
+
+
+DEFAULT_LMSTUDIO_DIR = _detect_lmstudio_downloads_folder()
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -489,7 +508,7 @@ def scan_hf_cache(results: Results):
     Scan every HF/ModelScope cache root in HF_CACHE_DIRS for model repos.
     Reports models that are LFS pointers (need downloading) vs fully
     downloaded. Roots are deduped by resolved physical path so the
-    `~/.cache/huggingface` symlink doesn't cause double-scanning.
+    `<REDACTED_PATH>` symlink doesn't cause double-scanning.
     """
     seen_repo_real: set[Path] = set()
     seen_root_real: set[Path] = set()
@@ -959,7 +978,7 @@ def clean_partial_downloads(scan_roots, dry_run: bool, results: Results):
     by_repo = {}  # (root, repo_dir) -> (count, bytes)
     home = str(Path.home())
 
-    # Dedupe by resolved path — ~/.cache/huggingface is often a symlink to an SSD
+    # Dedupe by resolved path — <REDACTED_PATH> is often a symlink to an SSD
     seen_roots = set()
     unique_roots = []
     for root in scan_roots:
@@ -1205,144 +1224,421 @@ def _find_hf_latest_snapshot(hf_dir: Path) -> Path:
     return max(snapshots, key=lambda d: d.stat().st_mtime)
 
 
-def migrate_hf_cache_dirs(models_dir: Path, dry_run: bool, cleanup: bool, results: Results):
+def migrate_hf_cache_dirs(lmstudio_dir: Path, dry_run: bool, cleanup: bool, results: Results):
     """
     Convert HuggingFace cache-style dirs (`models--owner--repo/snapshots/<hash>/...`)
-    into the standard publisher/repo/ layout that LM Studio expects.
+    found anywhere under HF_CACHE_DIRS into LM Studio's expected publisher/repo/
+    layout under `lmstudio_dir`.
 
     Uses hardlinks when on the same filesystem (instant, zero extra disk) and
     falls back to copy2 otherwise. Leaves the `models--*--*` source intact unless
     cleanup=True so an aborted/partial migration can't destroy data.
 
-    Silently skips `datasets--*--*` and any non-HF-cache directories.
+    Silently skips `datasets--*--*` and any non-HF-cache directories. Roots and
+    repos are deduped by resolved physical path so a symlinked cache root
+    (e.g. <REDACTED_PATH> -> <REDACTED_PATH>) doesn't cause
+    double-migration.
     """
-    if not models_dir.is_dir():
-        return
+    if not lmstudio_dir.exists():
+        try:
+            lmstudio_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return
 
     try:
-        dest_dev = models_dir.stat().st_dev
+        dest_dev = lmstudio_dir.stat().st_dev
     except OSError:
         dest_dev = None
 
-    for entry in sorted(models_dir.iterdir()):
-        if not entry.is_dir() or entry.is_symlink():
+    seen_root_real: set[Path] = set()
+    seen_repo_real: set[Path] = set()
+
+    for cache_root in HF_CACHE_DIRS:
+        if not cache_root.is_dir():
             continue
-        name = entry.name
-
-        parsed = _parse_hf_cache_name(name)
-        if parsed is None:
-            continue  # skip datasets--*, non-HF dirs, etc.
-        publisher, repo = parsed
-        display = f"{publisher}/{repo}"
-
-        snap = _find_hf_latest_snapshot(entry)
-        if snap is None:
-            results.broken.append((display, entry, "No usable snapshot in HF cache dir"))
-            continue
-
-        # Is this actually a model (not tokenizer-only / config-only)?
-        has_weights = any(
-            f.suffix in ALL_MODEL_EXTENSIONS for f in snap.iterdir()
-        )
-        if not has_weights:
-            continue
-
-        # Flag LFS pointers — migrating them would produce useless stubs
-        lfs_pointers = []
-        weight_files = []
-        for f in sorted(snap.iterdir()):
-            if not (f.is_file() or f.is_symlink()):
-                continue
-            if f.name.startswith("."):
-                continue
-            if f.suffix in ALL_MODEL_EXTENSIONS:
-                weight_files.append(f)
-                if is_lfs_pointer(f):
-                    lfs_pointers.append(f.name)
-
-        if lfs_pointers:
-            sample = ", ".join(lfs_pointers[:3])
-            if len(lfs_pointers) > 3:
-                sample += f" +{len(lfs_pointers) - 3} more"
-            results.broken.append(
-                (display, entry, f"LFS pointers — needs download: {sample}")
-            )
-            continue
-
-        dest_dir = models_dir / publisher / repo
-
-        # Idempotency: if destination already has every weight file at same size, skip
-        if dest_dir.is_dir():
-            existing = {f.name: f.stat().st_size
-                        for f in dest_dir.iterdir() if f.is_file()}
-            try:
-                src_sizes = {f.name: f.resolve().stat().st_size for f in weight_files}
-            except OSError:
-                src_sizes = {}
-            if src_sizes and all(existing.get(n) == sz for n, sz in src_sizes.items()):
-                if cleanup and not dry_run:
-                    try:
-                        shutil.rmtree(entry)
-                        print(f"  CLEANUP {name}/  (already migrated)")
-                    except OSError as e:
-                        print(f"  ERROR cleaning {name}: {e}")
-                continue
-
-        # Gather every file to migrate (weights + companions)
-        files_to_migrate = []
-        total_size = 0
-        for f in sorted(snap.iterdir()):
-            if not (f.is_file() or f.is_symlink()) or f.name.startswith("."):
-                continue
-            try:
-                real = f.resolve()
-                if not real.is_file():
-                    continue
-                total_size += real.stat().st_size
-            except OSError:
-                continue
-            files_to_migrate.append((f, real))
-
-        if not files_to_migrate:
-            continue
-
-        # Decide link strategy
         try:
-            src_dev = snap.stat().st_dev
-            can_hardlink = dest_dev is not None and src_dev == dest_dev
+            real_root = cache_root.resolve()
+        except (OSError, RuntimeError):
+            real_root = cache_root
+        if real_root in seen_root_real:
+            continue
+        seen_root_real.add(real_root)
+
+        try:
+            entries = sorted(cache_root.iterdir())
         except OSError:
-            can_hardlink = False
-
-        method = "HARDLINK" if can_hardlink else "COPY"
-        print(f"  HF-MIGRATE  {name}/ -> {display}/ "
-              f"({len(files_to_migrate)} files, {format_size(total_size)}, {method})")
-
-        if dry_run:
-            results.fixed.append((display, entry, dest_dir))
             continue
 
-        try:
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            for link, real_src in files_to_migrate:
-                dst = dest_dir / link.name
-                if dst.exists():
-                    continue
-                if can_hardlink:
-                    try:
-                        os.link(real_src, dst)
-                    except OSError:
-                        # Fall back to copy if hardlink fails (e.g., cross-device, perms)
-                        shutil.copy2(real_src, dst)
-                else:
-                    shutil.copy2(real_src, dst)
-            results.fixed.append((display, entry, dest_dir))
+        for entry in entries:
+            if not entry.is_dir() or entry.is_symlink():
+                continue
+            name = entry.name
 
-            if cleanup:
-                shutil.rmtree(entry)
-                print(f"              source removed")
+            parsed = _parse_hf_cache_name(name)
+            if parsed is None:
+                continue  # skip datasets--*, non-HF dirs, etc.
+
+            try:
+                real_repo = entry.resolve()
+            except (OSError, RuntimeError):
+                real_repo = entry
+            if real_repo in seen_repo_real:
+                continue
+            seen_repo_real.add(real_repo)
+
+            publisher, repo = parsed
+            display = f"{publisher}/{repo}"
+
+            snap = _find_hf_latest_snapshot(entry)
+            if snap is None:
+                results.broken.append((display, entry, "No usable snapshot in HF cache dir"))
+                continue
+
+            # Is this actually a model (not tokenizer-only / config-only)?
+            has_weights = any(
+                f.suffix in ALL_MODEL_EXTENSIONS for f in snap.iterdir()
+            )
+            if not has_weights:
+                continue
+
+            # Flag LFS pointers — migrating them would produce useless stubs
+            lfs_pointers = []
+            weight_files = []
+            for f in sorted(snap.iterdir()):
+                if not (f.is_file() or f.is_symlink()):
+                    continue
+                if f.name.startswith("."):
+                    continue
+                if f.suffix in ALL_MODEL_EXTENSIONS:
+                    weight_files.append(f)
+                    if is_lfs_pointer(f):
+                        lfs_pointers.append(f.name)
+
+            if lfs_pointers:
+                sample = ", ".join(lfs_pointers[:3])
+                if len(lfs_pointers) > 3:
+                    sample += f" +{len(lfs_pointers) - 3} more"
+                results.broken.append(
+                    (display, entry, f"LFS pointers — needs download: {sample}")
+                )
+                continue
+
+            dest_dir = lmstudio_dir / publisher / repo
+
+            # Idempotency: if destination already has every weight file at same size, skip
+            if dest_dir.is_dir():
+                existing = {f.name: f.stat().st_size
+                            for f in dest_dir.iterdir() if f.is_file()}
+                try:
+                    src_sizes = {f.name: f.resolve().stat().st_size for f in weight_files}
+                except OSError:
+                    src_sizes = {}
+                if src_sizes and all(existing.get(n) == sz for n, sz in src_sizes.items()):
+                    if cleanup and not dry_run:
+                        try:
+                            shutil.rmtree(entry)
+                            print(f"  CLEANUP {name}/  (already migrated)")
+                        except OSError as e:
+                            print(f"  ERROR cleaning {name}: {e}")
+                    continue
+
+            # Gather every file to migrate (weights + companions)
+            files_to_migrate = []
+            total_size = 0
+            for f in sorted(snap.iterdir()):
+                if not (f.is_file() or f.is_symlink()) or f.name.startswith("."):
+                    continue
+                try:
+                    real = f.resolve()
+                    if not real.is_file():
+                        continue
+                    total_size += real.stat().st_size
+                except OSError:
+                    continue
+                files_to_migrate.append((f, real))
+
+            if not files_to_migrate:
+                continue
+
+            # Decide link strategy
+            try:
+                src_dev = snap.stat().st_dev
+                can_hardlink = dest_dev is not None and src_dev == dest_dev
+            except OSError:
+                can_hardlink = False
+
+            method = "HARDLINK" if can_hardlink else "COPY"
+            print(f"  HF-MIGRATE  {name}/ -> {display}/ "
+                  f"({len(files_to_migrate)} files, {format_size(total_size)}, {method})")
+
+            if dry_run:
+                results.fixed.append((display, entry, dest_dir))
+                continue
+
+            try:
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                for link, real_src in files_to_migrate:
+                    dst = dest_dir / link.name
+                    if dst.exists():
+                        continue
+                    if can_hardlink:
+                        try:
+                            os.link(real_src, dst)
+                        except OSError:
+                            # Fall back to copy if hardlink fails (e.g., cross-device, perms)
+                            shutil.copy2(real_src, dst)
+                    else:
+                        shutil.copy2(real_src, dst)
+                results.fixed.append((display, entry, dest_dir))
+
+                if cleanup:
+                    shutil.rmtree(entry)
+                    print(f"              source removed")
+            except OSError as e:
+                print(f"              ERROR: {e}")
+                results.errors.append((display, f"HF migration failed: {e}"))
+
+
+# ──────────────────────────────────────────────────────────────────────
+# HuggingFace cache resume — re-download interrupted models--owner--repo/
+# dirs that have only a refs/ entry (no blobs/, no snapshots/).
+# ──────────────────────────────────────────────────────────────────────
+
+def find_broken_hf_cache_dirs():
+    """
+    Walk HF_CACHE_DIRS and yield (cache_root, entry, owner, repo) for every
+    `models--owner--repo` dir whose snapshots/ is missing or empty. Roots and
+    repos are deduped by resolved physical path.
+    """
+    seen_root_real: set[Path] = set()
+    seen_repo_real: set[Path] = set()
+
+    for cache_root in HF_CACHE_DIRS:
+        if not cache_root.is_dir():
+            continue
+        try:
+            real_root = cache_root.resolve()
+        except (OSError, RuntimeError):
+            real_root = cache_root
+        if real_root in seen_root_real:
+            continue
+        seen_root_real.add(real_root)
+
+        try:
+            entries = sorted(cache_root.iterdir())
+        except OSError:
+            continue
+
+        for entry in entries:
+            if not entry.is_dir() or entry.is_symlink():
+                continue
+            parsed = _parse_hf_cache_name(entry.name)
+            if parsed is None:
+                continue
+            try:
+                real_repo = entry.resolve()
+            except (OSError, RuntimeError):
+                real_repo = entry
+            if real_repo in seen_repo_real:
+                continue
+            seen_repo_real.add(real_repo)
+
+            owner, repo = parsed
+            if _find_hf_latest_snapshot(entry) is None:
+                yield (cache_root, entry, owner, repo)
+
+
+def resume_broken_hf_downloads(dry_run: bool, workers: int = 1) -> None:
+    """
+    Resume broken HF hub cache downloads via huggingface_hub.snapshot_download.
+    snapshot_download is idempotent — it hashes existing blobs and only fetches
+    missing ones. Honors HF_TOKEN env var (or <REDACTED_PATH>) for
+    gated repos. Skips on auth/404/network errors with a clear reason.
+    """
+    try:
+        from huggingface_hub import snapshot_download
+        try:
+            from huggingface_hub.errors import (
+                GatedRepoError, RepositoryNotFoundError, HfHubHTTPError,
+            )
+        except ImportError:  # huggingface_hub < 0.20
+            from huggingface_hub.utils import (
+                GatedRepoError, RepositoryNotFoundError, HfHubHTTPError,
+            )
+    except ImportError:
+        print("  [!] huggingface_hub not installed; pip install huggingface_hub")
+        return
+
+    candidates = list(find_broken_hf_cache_dirs())
+    if not candidates:
+        print("  No broken HF cache dirs to resume.")
+        return
+
+    print(f"  Found {len(candidates)} broken HF cache dir(s).")
+
+    if dry_run:
+        try:
+            from huggingface_hub import HfApi
+            api = HfApi()
+        except ImportError:
+            api = None
+        total = 0
+        for cache_root, entry, owner, repo in candidates:
+            repo_id = f"{owner}/{repo}"
+            size_str = "size unknown"
+            if api is not None:
+                try:
+                    info = api.model_info(repo_id, files_metadata=True)
+                    size = sum((s.size or 0) for s in info.siblings if s.size)
+                    if size:
+                        total += size
+                        size_str = format_size(size)
+                except (GatedRepoError, RepositoryNotFoundError, HfHubHTTPError) as e:
+                    size_str = f"size unavailable ({type(e).__name__})"
+                except Exception as e:
+                    size_str = f"size unavailable ({type(e).__name__})"
+            print(f"    DRY  {repo_id:<60} cache={cache_root}  {size_str}")
+        if total:
+            print(f"  Estimated total to download: {format_size(total)}")
+        return
+
+    success: list[str] = []
+    failed: list[tuple[str, str]] = []
+
+    def _resume_one(args_tuple):
+        cache_root, entry, owner, repo = args_tuple
+        repo_id = f"{owner}/{repo}"
+        try:
+            snapshot_download(repo_id=repo_id, cache_dir=str(cache_root))
+            return (repo_id, True, None)
+        except GatedRepoError:
+            return (repo_id, False, "GATED — set HF_TOKEN")
+        except RepositoryNotFoundError:
+            return (repo_id, False, "NOT_FOUND on HF")
+        except HfHubHTTPError as e:
+            status = getattr(e.response, "status_code", "?") if getattr(e, "response", None) else "?"
+            return (repo_id, False, f"HTTP {status}")
         except OSError as e:
-            print(f"              ERROR: {e}")
-            results.errors.append((display, f"HF migration failed: {e}"))
+            return (repo_id, False, f"OSError: {e}")
+        except Exception as e:
+            return (repo_id, False, f"{type(e).__name__}: {e}")
+
+    if workers <= 1:
+        for tup in candidates:
+            repo_id, ok, err = _resume_one(tup)
+            if ok:
+                _tlog(f"  ✓ RESUMED  {repo_id}")
+                success.append(repo_id)
+            else:
+                _tlog(f"  ✗ FAILED   {repo_id}  ({err})")
+                failed.append((repo_id, err))
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = {ex.submit(_resume_one, tup): tup for tup in candidates}
+            for future in as_completed(futures):
+                repo_id, ok, err = future.result()
+                if ok:
+                    _tlog(f"  ✓ RESUMED  {repo_id}")
+                    success.append(repo_id)
+                else:
+                    _tlog(f"  ✗ FAILED   {repo_id}  ({err})")
+                    failed.append((repo_id, err))
+
+    print(f"  Resume summary: {len(success)} resumed, {len(failed)} failed")
+
+
+# Extra location where model_manager.py steers huggingface_hub.snapshot_download
+# refs/<revision> stubs to keep them out of the user's real HF_HUB_CACHE.
+_MODEL_MANAGER_STUB_CACHE = Path.home() / ".cache" / "model_manager" / "hf_refs_stubs"
+
+
+def report_orphan_hf_stubs() -> None:
+    """
+    Walk every HF cache root (the user's real caches plus the model_manager
+    throwaway stub cache) and report every `models--owner--repo/` directory
+    that has only `refs/` and no blobs/ or snapshots/ — the residue left by
+    huggingface_hub.snapshot_download(local_dir=...) when the actual files go
+    to local_dir but the library still writes a refs/<revision> stub.
+
+    READ-ONLY. Prints exact `rm -rf` commands grouped by parent dir for the
+    user to copy and run; never deletes anything itself.
+    """
+    locations = list(HF_CACHE_DIRS) + [_MODEL_MANAGER_STUB_CACHE]
+
+    seen_root_real: set[Path] = set()
+    seen_repo_real: set[Path] = set()
+    orphans: list[Path] = []
+
+    for cache_root in locations:
+        if not cache_root.is_dir():
+            continue
+        try:
+            real_root = cache_root.resolve()
+        except (OSError, RuntimeError):
+            real_root = cache_root
+        if real_root in seen_root_real:
+            continue
+        seen_root_real.add(real_root)
+
+        try:
+            entries = sorted(cache_root.iterdir())
+        except OSError:
+            continue
+
+        for entry in entries:
+            if not entry.is_dir() or entry.is_symlink():
+                continue
+            if not entry.name.startswith(("models--", "datasets--")):
+                continue
+            try:
+                real_repo = entry.resolve()
+            except (OSError, RuntimeError):
+                real_repo = entry
+            if real_repo in seen_repo_real:
+                continue
+            seen_repo_real.add(real_repo)
+
+            try:
+                children = {p.name for p in entry.iterdir()}
+            except OSError:
+                continue
+            if "refs" not in children:
+                continue
+            blobs_dir = entry / "blobs"
+            snapshots_dir = entry / "snapshots"
+            try:
+                has_blobs = blobs_dir.is_dir() and any(blobs_dir.iterdir())
+            except OSError:
+                has_blobs = False
+            try:
+                has_snapshots = snapshots_dir.is_dir() and any(snapshots_dir.iterdir())
+            except OSError:
+                has_snapshots = False
+            if has_blobs or has_snapshots:
+                continue
+            orphans.append(entry)
+
+    if not orphans:
+        print("  No orphan HF cache stubs found.")
+        return
+
+    print(f"  Found {len(orphans)} orphan HF cache stub(s) (refs/ only, no blobs/snapshots).")
+    print(f"  These are bookkeeping residue from huggingface_hub.snapshot_download —")
+    print(f"  the actual model data is elsewhere. Each stub is ~96 bytes.")
+    print()
+    print(f"  To delete them, copy and run these commands:")
+    print()
+
+    by_parent: dict[Path, list[str]] = {}
+    for o in orphans:
+        by_parent.setdefault(o.parent, []).append(o.name)
+    for parent in sorted(by_parent):
+        names = sorted(by_parent[parent])
+        print(f"  cd {parent} && rm -rf \\")
+        for i, name in enumerate(names):
+            sep = " \\" if i < len(names) - 1 else ""
+            print(f"    {name}{sep}")
+        print()
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1777,12 +2073,35 @@ def main():
     parser.add_argument("--no-ollama", action="store_true", help="Skip Ollama registration.")
     parser.add_argument("--force", action="store_true", help="Re-register all with Ollama.")
     parser.add_argument(
-        "--migrate-hf-cache", action="store_true",
-        help="Convert HuggingFace cache dirs (models--owner--repo/) into publisher/repo/ layout.",
+        "--migrate-hf-cache", action=argparse.BooleanOptionalAction, default=True,
+        help="Convert HuggingFace cache dirs (models--owner--repo/) under HF_CACHE_DIRS "
+             "into LM Studio's publisher/repo/ layout under --lmstudio-dir. "
+             "Default: enabled. Use --no-migrate-hf-cache to skip.",
+    )
+    parser.add_argument(
+        "--lmstudio-dir", type=Path, default=DEFAULT_LMSTUDIO_DIR,
+        help=f"Destination root for HF-cache migration (LM Studio's downloadsFolder). "
+             f"Default: {DEFAULT_LMSTUDIO_DIR}",
     )
     parser.add_argument(
         "--cleanup-hf-source", action="store_true",
         help="After a successful HF cache migration, delete the original models--*--* dir.",
+    )
+    parser.add_argument(
+        "--resume-broken", action="store_true",
+        help="Resume HF hub-cache downloads that have refs/ but no usable snapshot (failed "
+             "or interrupted downloads). Uses huggingface_hub.snapshot_download — idempotent, "
+             "honors HF_TOKEN. Combined with --dry-run reports per-repo size estimate only.",
+    )
+    parser.add_argument(
+        "--resume-broken-workers", type=int, default=1, metavar="N",
+        help="Parallel repos when resuming (default 1; HF rate limits make >2 risky).",
+    )
+    parser.add_argument(
+        "--clean-orphan-stubs", action="store_true",
+        help="Scan HF cache roots for `models--*` dirs that contain only refs/ and no "
+             "blobs/snapshots/ — bookkeeping residue from huggingface_hub.snapshot_download. "
+             "Prints copy-pasteable rm commands; never deletes anything itself.",
     )
     parser.add_argument(
         "--clean-partial-downloads", action="store_true",
@@ -1806,8 +2125,8 @@ def main():
     )
     parser.add_argument(
         "--flatten-output", type=Path,
-        default=Path("/Volumes/ModelStorage/models-flat"),
-        help="Target directory for flattened models (default: /Volumes/ModelStorage/models-flat).",
+        default=Path("<Your Model Directory>"),
+        help="Target directory for flattened models (default: <Your Model Directory>).",
     )
     parser.add_argument(
         "--flatten-input", type=Path, action="append", default=[],
@@ -1854,9 +2173,18 @@ def main():
 
     # Step 1.5: Migrate HF cache dirs if requested (must happen BEFORE scan_loose_models
     # so the newly-created publisher/repo/ dirs get picked up normally)
+    if args.clean_orphan_stubs:
+        print("Scanning for orphan HF cache stubs...")
+        report_orphan_hf_stubs()
+
+    if args.resume_broken:
+        print("Resuming broken HF cache downloads...")
+        resume_broken_hf_downloads(args.dry_run, workers=args.resume_broken_workers)
+
     if args.migrate_hf_cache:
-        print("Migrating HuggingFace cache dirs...")
-        migrate_hf_cache_dirs(models_dir, args.dry_run, args.cleanup_hf_source, results)
+        lmstudio_dir = args.lmstudio_dir.expanduser().resolve()
+        print(f"Migrating HuggingFace cache dirs into {lmstudio_dir}...")
+        migrate_hf_cache_dirs(lmstudio_dir, args.dry_run, args.cleanup_hf_source, results)
 
     # Step 2: Scan loose model files and fix structure
     print("Scanning model files...")
