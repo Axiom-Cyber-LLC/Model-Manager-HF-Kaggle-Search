@@ -4019,6 +4019,42 @@ def load_csv_rows(path: Path) -> list[dict[str, Any]]:
         return []
 
 
+_XLSX_NOISE_SHEET_PATTERNS = (
+    # Substrings of sheet names that are NOT actual risk-data tabs in
+    # taxonomy-style workbooks (MIT AI Risk Repository, similar). These
+    # tabs hold prose, statistics, change logs, or table-of-contents
+    # entries — loading their cells produces noisy fake "risk terms".
+    "contents", "taxonomy", "explainer", "statistics",
+    "compar",  # "Causal x Domain Taxonomy compar"
+    "included", "considered",  # "Included resources", "Resources being considered"
+    "change log", "changelog", "readme", "guide",
+)
+
+
+def _xlsx_sheet_is_noise(name: str) -> bool:
+    n = (name or "").lower()
+    return any(p in n for p in _XLSX_NOISE_SHEET_PATTERNS)
+
+
+def _looks_like_header_row(values: tuple) -> bool:
+    """Heuristic: a real header row has multiple short, distinct, non-banner
+    string cells. Reject rows that are mostly empty, contain a single long
+    sentence, start with warning glyphs, or include "Updated:" / "Last
+    Modified" timestamps."""
+    cells = [str(v).strip() if v is not None else "" for v in values]
+    nonempty = [c for c in cells if c]
+    if len(nonempty) < 3:
+        return False
+    for c in nonempty:
+        if c.startswith(("⚠", "WARNING", "Watch ", "View ")):
+            return False
+        if "IMPORTANT NOTE" in c or "Updated:" in c or "Last Modified" in c:
+            return False
+        if len(c) > 60:  # long prose, almost certainly a banner
+            return False
+    return True
+
+
 def load_xlsx_rows(path: Path) -> list[dict[str, Any]]:
     try:
         import openpyxl  # type: ignore
@@ -4029,10 +4065,22 @@ def load_xlsx_rows(path: Path) -> list[dict[str, Any]]:
     try:
         wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
         for ws in wb.worksheets:
+            if _xlsx_sheet_is_noise(ws.title):
+                continue
+            # Real header row may be preceded by banner/title/blank rows
+            # (common in research workbooks). Scan up to 20 rows for the
+            # first that looks like real column headers.
             iterator = ws.iter_rows(values_only=True)
-            try:
-                header = next(iterator)
-            except StopIteration:
+            header: tuple | None = None
+            scanned = 0
+            for row_values in iterator:
+                scanned += 1
+                if _looks_like_header_row(row_values):
+                    header = row_values
+                    break
+                if scanned >= 20:
+                    break
+            if header is None:
                 continue
             keys = [str(x).strip() if x is not None else "" for x in header]
             if not any(keys):
@@ -4225,6 +4273,18 @@ def load_owner_reputation_sets() -> dict[str, set[str]]:
     return {key: set(value) for key, value in _OWNER_REPUTATION_CACHE.items()}
 
 
+_RISK_TERM_GENERIC_BLOCKLIST = {
+    # MIT AI Risk Repository taxonomy / schema noise
+    "paper", "papers", "additional evidence", "risk category", "risk subcategory",
+    "category level", "domain", "subdomain", "causal factor",
+    "intentional", "unintentional", "pre-deployment", "post-deployment",
+    "human", "ai", "yes", "no", "n/a", "na", "true", "false",
+    "tbd", "unknown", "see paper", "various",
+    # Common spreadsheet noise
+    "header", "footer", "sheet", "table", "row", "column",
+}
+
+
 def risk_row_terms(row: dict[str, Any]) -> list[str]:
     preferred = [
         "repo", "repo_id", "model", "model_id", "name", "artifact", "owner", "publisher",
@@ -4236,13 +4296,31 @@ def risk_row_terms(row: dict[str, Any]) -> list[str]:
         value = lowered.get(key)
         if value not in {None, ""}:
             terms.append(str(value))
-    # Fallback: short textual cells from any column, useful for messy spreadsheets.
+    # Fallback: short textual cells from any column. Filter out plain English
+    # words and generic schema noise — real indicators almost always contain
+    # at least one non-letter character (digit, hyphen, slash, dot, colon)
+    # because they're repo IDs, version strings, file names, or hashes.
     for key, value in row.items():
         if str(key).startswith("_") or value in {None, ""}:
             continue
         text = str(value).strip()
-        if 3 <= len(text) <= 140 and any(ch.isalpha() for ch in text):
-            terms.append(text)
+        if not (3 <= len(text) <= 140):
+            continue
+        if not any(ch.isalpha() for ch in text):
+            continue
+        # Real indicators (repo IDs, file names, version strings, hashes, URLs)
+        # almost always contain a digit, slash, dot, or colon. Plain English
+        # phrases — even compound ones like "Risk Sub-Category" — don't.
+        # Hyphens and underscores are allowed in plain English so we don't
+        # treat them as indicator markers.
+        has_digit = any(ch.isdigit() for ch in text)
+        has_strong_sep = any(ch in "/.:" for ch in text)
+        long_enough = len(text) >= 60
+        if not (has_digit or has_strong_sep or long_enough):
+            continue
+        if text.lower() in _RISK_TERM_GENERIC_BLOCKLIST:
+            continue
+        terms.append(text)
     # De-dup while preserving order.
     seen: set[str] = set()
     clean: list[str] = []

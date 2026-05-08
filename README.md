@@ -10,6 +10,14 @@ This public repository was rebuilt from a sanitized export. Do not commit local 
 
 ## Recent changes
 
+### 2026-05-08 (risk-intel noise filter)
+
+**`model_manager.py`**
+- Pre-download risk-intel matching against the local AI Risk Repository / similar workbooks no longer floods INFO findings with generic words like `Paper`, `Risk Category`, etc. Three layered fixes in `load_xlsx_rows` and `risk_row_terms`:
+  1. **Sheet allow-list**: workbook tabs whose names match noise patterns (`contents`, `taxonomy`, `explainer`, `statistics`, `compar`, `included`, `considered`, `change log`, `readme`, `guide`) are skipped. Only the actual data tab(s) are loaded.
+  2. **Header-row scan**: research workbooks often prepend a banner / "Updated:" / "View video" row before the real columns. The loader now scans up to 20 rows for one that looks like real headers (≥3 short non-banner cells) and uses *that* as the column names. Previously, a banner row was treated as headers, scrambling all column lookups.
+  3. **Stricter fallback term filter**: terms extracted from non-preferred columns must contain a digit, slash, dot, or colon — or be ≥60 chars. Plain English compound words (e.g. "Risk Sub-Category") no longer slip through. A small blocklist of taxonomy-noise terms is also applied.
+
 ### 2026-05-08 (scanner watchdog)
 
 **`model_manager.py`**
