@@ -2184,6 +2184,83 @@ def report_dangling_symlinks(extra_roots: list[Path] | None = None) -> None:
 # Loose file scanning — models with actual weight files in directories
 # ──────────────────────────────────────────────────────────────────────
 
+# Names under lmstudio_dir that are NOT publisher/<repo>/ trees and should be
+# ignored by the read-only scan (HF cache layout, internal stores, etc.).
+_LMSTUDIO_SCAN_SKIP_TOPLEVEL = {
+    "huggingface", "hub", "xet", "blobs", "manifests", "refs", "snapshots",
+    ".cache", ".incoming", "dataset", "model",
+    "local",  # the manager's flat-named bucket — already covered by scan_loose_models
+}
+
+
+def scan_lmstudio_dir_readonly(lmstudio_dir: Path, results: Results) -> None:
+    """
+    Add publisher/repo/ entries from lmstudio_dir to results.ready WITHOUT
+    fixing or moving anything. Strict: only counts dirs at depth exactly two
+    that contain at least one weight file (.gguf/.safetensors/etc.).
+
+    Dedupes against existing results.ready by display name so a model that's
+    already been added by scan_loose_models (because it's also in models_dir
+    via hardlink) is not double-counted.
+    """
+    existing_names: set[str] = {entry[0] for entry in results.ready}
+
+    try:
+        publishers = sorted(lmstudio_dir.iterdir())
+    except OSError:
+        return
+
+    for publisher in publishers:
+        if not publisher.is_dir() or publisher.is_symlink():
+            continue
+        name = publisher.name
+        if name.startswith(".") or name in _LMSTUDIO_SCAN_SKIP_TOPLEVEL:
+            continue
+        if name.startswith(("models--", "datasets--")):
+            continue
+
+        try:
+            repos = sorted(publisher.iterdir())
+        except OSError:
+            continue
+
+        for repo in repos:
+            if not repo.is_dir() or repo.is_symlink():
+                continue
+            display = f"{publisher.name}/{repo.name}"
+            if display in existing_names:
+                continue
+
+            try:
+                files = list(repo.iterdir())
+            except OSError:
+                continue
+
+            weight_files = [f for f in files
+                            if f.is_file() and f.suffix in ALL_MODEL_EXTENSIONS]
+            if not weight_files:
+                continue
+
+            total_size = 0
+            for f in weight_files:
+                try:
+                    total_size += f.stat().st_size
+                except OSError:
+                    pass
+
+            if any(f.suffix == ".gguf" for f in weight_files):
+                mtype = "GGUF"
+            elif any(f.suffix == ".safetensors" for f in weight_files):
+                mtype = "safetensors"
+            elif any(f.suffix in {".mlmodel", ".mlpackage"} for f in weight_files):
+                mtype = "Core ML"
+            else:
+                mtype = "model"
+
+            results.ready.append((display, format_size(total_size), mtype))
+            existing_names.add(display)
+
+
 def scan_loose_models(models_dir: Path, dry_run: bool, results: Results):
     """
     Scan for models with actual weight files in publisher/model/ directories
@@ -2764,9 +2841,16 @@ def main():
             print(f"Mirroring publisher/repo/ trees from {models_dir} into {lmstudio_dir}...")
             mirror_models_flat_to_lmstudio(models_dir, lmstudio_dir, args.dry_run, results)
 
-    # Step 2: Scan loose model files and fix structure
+    # Step 2: Scan loose model files and fix structure.
     print("Scanning model files...")
     scan_loose_models(models_dir, args.dry_run, results)
+    # Read-only second pass over lmstudio_dir so READY surfaces any model
+    # that's been hardlinked into LM Studio's downloadsFolder by the migration
+    # steps above. We do NOT use scan_loose_models here — that one tries to
+    # FIX layouts and restructures the disk, which would litter the destination.
+    lmstudio_dir = args.lmstudio_dir.expanduser().resolve()
+    if lmstudio_dir.is_dir() and lmstudio_dir.resolve() != models_dir.resolve():
+        scan_lmstudio_dir_readonly(lmstudio_dir, results)
 
     # Step 2.25: Validate mount-readiness of every model in publisher/repo/ layout
     if args.validate:

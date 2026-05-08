@@ -10,6 +10,11 @@ This public repository was rebuilt from a sanitized export. Do not commit local 
 
 ## Recent changes
 
+### 2026-05-08 (still later)
+
+**`Prepare_models_for_Lmstudio.py`**
+- New: **read-only second scan over `--lmstudio-dir`** (the LM Studio downloadsFolder). After the existing scan over `--input` (`models-flat`), the prep now also walks `<lmstudio-dir>/<publisher>/<repo>/<files>` and adds to READY any model that's hardlinked there. Closes the loop on the previous migration changes — newly-downloaded models that land in `lmstudio_dir` via the migrations now appear in the READY listing instead of being silently absent. Read-only by design (does not touch or restructure files), and dedupes against the first scan by display name.
+
 ### 2026-05-08 (later still)
 
 **`Prepare_models_for_Lmstudio.py`**
