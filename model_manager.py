@@ -3515,9 +3515,16 @@ def run_external_security_tools(target: Path) -> list[dict[str, str]]:
         risky_hits: list[str] = []
         recent_lines: list[str] = []
         saw_invocation_error = False
+        # Per-scanner wall-clock cap (default 10 minutes; tune with env). Without
+        # this, a scanner that hangs without producing stdout (e.g., reading
+        # from stdin, blocked on a TUI prompt, or long-running) freezes the
+        # whole audit step. The watchdog thread kills the process after the
+        # timeout so the for-loop unblocks via EOF.
+        scanner_timeout = env_int("MODEL_MANAGER_SCANNER_TIMEOUT_S", 600, minimum=10)
         try:
             proc = subprocess.Popen(
                 scanner.cmd,
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -3525,16 +3532,41 @@ def run_external_security_tools(target: Path) -> list[dict[str, str]]:
                 cwd=str(scanner.cwd) if scanner.cwd else None,
             )
             assert proc.stdout is not None
-            for line in proc.stdout:
-                clean = line.rstrip("\n")
-                print(clean)
-                if len(recent_lines) >= 80:
-                    recent_lines.pop(0)
-                recent_lines.append(clean)
-                if low_signal_re.search(clean):
-                    saw_invocation_error = True
-                if high_risk_re.search(clean):
-                    risky_hits.append(clean[:300])
+
+            killed_by_timeout = {"flag": False}
+            import threading
+
+            def _kill_after_timeout():
+                killed_by_timeout["flag"] = True
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+            timer = threading.Timer(scanner_timeout, _kill_after_timeout)
+            timer.daemon = True
+            timer.start()
+            try:
+                for line in proc.stdout:
+                    clean = line.rstrip("\n")
+                    print(clean)
+                    if len(recent_lines) >= 80:
+                        recent_lines.pop(0)
+                    recent_lines.append(clean)
+                    if low_signal_re.search(clean):
+                        saw_invocation_error = True
+                    if high_risk_re.search(clean):
+                        risky_hits.append(clean[:300])
+            finally:
+                timer.cancel()
+
+            if killed_by_timeout["flag"]:
+                findings.append({"severity": "WARN", "message": f"scanner killed after {scanner_timeout}s timeout: {scanner.label} (set MODEL_MANAGER_SCANNER_TIMEOUT_S to extend)"})
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                continue
             rc = proc.wait(timeout=10)
             if rc not in (0, None):
                 if saw_invocation_error:

@@ -10,6 +10,11 @@ This public repository was rebuilt from a sanitized export. Do not commit local 
 
 ## Recent changes
 
+### 2026-05-08 (scanner watchdog)
+
+**`model_manager.py`**
+- Post-download scanner step now has a **per-scanner watchdog**. Previously a scanner that hung without producing stdout (e.g., `skillcheck` waiting on stdin or any TUI prompt) blocked the for-loop reading stdout indefinitely — the existing `proc.wait(timeout=10)` only fires *after* the loop completes, so it never kicked in. Two fixes: (a) `stdin=subprocess.DEVNULL` is now passed so scanners cannot block on stdin, and (b) a `threading.Timer` watchdog kills any scanner that exceeds `MODEL_MANAGER_SCANNER_TIMEOUT_S` (default 600 = 10 minutes). Killed scanners surface as a WARN finding ("scanner killed after Ns timeout") and the audit continues with the next tool. Override the timeout per shell (`export MODEL_MANAGER_SCANNER_TIMEOUT_S=1800`) or one-off (`MODEL_MANAGER_SCANNER_TIMEOUT_S=1800 modelmgr ...`).
+
 ### 2026-05-08 (still later)
 
 **`Prepare_models_for_Lmstudio.py`**
