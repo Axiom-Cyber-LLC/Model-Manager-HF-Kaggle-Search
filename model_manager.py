@@ -4,6 +4,12 @@ model_manager_v1.8_family_filter.py
 
 Interactive model/dataset finder and downloader for Hugging Face and Kaggle.
 
+After download / audit prompts, this program may subprocess optional helpers that live beside
+model_manager.py (same directory) or under MODEL_MANAGER_TOOLS_DIR: Prepare_models_for_All.py,
+model_conversion.py, model_audit.py, external scanners (modelaudit, modelscan, ModelGuard, …),
+the Go hfdownloader binary, and model_manager_gui.swift (native GUI). These are never required
+for search or Hub download; they run only when you opt in or pass flags that trigger them.
+
 Core design:
   - Repos are search results.
   - Downloadable model artifacts inside a repo are discovered and selected separately.
@@ -15,7 +21,7 @@ Optional dependencies:
 
 Auth:
   HF_TOKEN or HUGGINGFACEHUB_API_TOKEN for gated/private Hugging Face repos.
-  ~/.kaggle/kaggle.json or KAGGLE_USERNAME/KAGGLE_KEY for Kaggle.
+  <REDACTED_PATH> or KAGGLE_USERNAME/KAGGLE_KEY for Kaggle.
 """
 
 from __future__ import annotations
@@ -34,7 +40,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -42,42 +50,56 @@ from typing import Any, Iterable
 # Defaults
 # -----------------------------------------------------------------------------
 
-MODEL_TOOLS_DIR = Path(os.getenv("MODEL_MANAGER_TOOLS_DIR", str(Path(__file__).resolve().parent))).expanduser().resolve()
+# Directory containing this file; used first when resolving Prepare_*, model_conversion, audit, scanners.
+MODEL_MANAGER_SCRIPT_DIR = Path(__file__).expanduser().resolve().parent
+
+MODEL_TOOLS_DIR = Path(os.getenv("MODEL_MANAGER_TOOLS_DIR", str(Path.home() / "model_tools"))).expanduser().resolve()
+
+_DEFAULT_SCANNER_DIR_NAMES = (
+    "modelaudit",
+    "modelscan",
+    "model-scan",
+    "ModelGuard",
+    "palisade-scan",
+    "skillcheck",
+    "skill-scanner",
+)
+_SECURITY_TOOL_ROOTS: list[Path] = []
+for _root in (MODEL_MANAGER_SCRIPT_DIR, MODEL_TOOLS_DIR):
+    _rp = _root.expanduser().resolve()
+    if _rp not in _SECURITY_TOOL_ROOTS:
+        _SECURITY_TOOL_ROOTS.append(_rp)
 
 DEFAULT_LOCAL_MODEL_DIRS = [
-    Path("/Volumes/ModelStorage/models"),
-    Path("/Volumes/ModelStorage/models-flat"),
-    Path("/Volumes/ModelStorage/.cache/huggingface"),
+    Path("<Your Model Directory>"),
+    Path("<Your Model Directory>"),
+    Path("<REDACTED_PATH>"),
     Path.home() / ".cache" / "huggingface",
-    Path("/Volumes/ModelStorage/.cache/modelscope"),
+    Path("<Your Model Directory>"),
 ]
 
 DEFAULT_SECURITY_TOOLS = [
-    MODEL_TOOLS_DIR / "modelaudit",
-    MODEL_TOOLS_DIR / "modelscan",
-    MODEL_TOOLS_DIR / "model-scan",
-    MODEL_TOOLS_DIR / "ModelGuard",
-    MODEL_TOOLS_DIR / "palisade-scan",
-    MODEL_TOOLS_DIR / "skillcheck",
-    MODEL_TOOLS_DIR / "skill-scanner",
-    Path("~/modelaudit/").expanduser(),
-    Path("~/modelscan").expanduser(),
-    Path("~/modelscan/").expanduser(),
-    Path("~/skillcheck/").expanduser(),
-    Path("~/skill-scanner").expanduser(),
-    Path("~/skill-scanner/").expanduser(),
+    *[root / name for root in _SECURITY_TOOL_ROOTS for name in _DEFAULT_SCANNER_DIR_NAMES],
+    Path("<REDACTED_PATH>").expanduser(),
+    Path("<REDACTED_PATH>").expanduser(),
+    Path("<REDACTED_PATH>").expanduser(),
+    Path("<REDACTED_PATH>").expanduser(),
+    Path("<REDACTED_PATH>").expanduser(),
+    Path("<REDACTED_PATH>").expanduser(),
 ]
 
 PREP_SCRIPT_CANDIDATES = [
-    MODEL_TOOLS_DIR / "Prepare_models_for_All.py",
-    Path("/Volumes/ModelStorage/models-flat/Prepare_models_for_All.py"),
+    MODEL_MANAGER_SCRIPT_DIR / "Prepare_models_for_All.py",
+    Path.home() / "model_tools" / "Prepare_models_for_All.py",
+    Path("<Your Model Directory>/Prepare_models_for_All.py"),
     Path("./Prepare_models_for_All.py"),
     Path.home() / "Prepare_models_for_All.py",
 ]
 
 CONVERSION_SCRIPT_CANDIDATES = [
-    MODEL_TOOLS_DIR / "model_conversion.py",
-    Path("/Volumes/ModelStorage/models-flat/model_conversion.py"),
+    MODEL_MANAGER_SCRIPT_DIR / "model_conversion.py",
+    Path.home() / "model_tools" / "model_conversion.py",
+    Path("<Your Model Directory>/model_conversion.py"),
     Path("./model_conversion.py"),
     Path.home() / "model_conversion.py",
 ]
@@ -102,15 +124,23 @@ PREP_APP_ORDER = [
 #   huggingface/dataset/<owner>__<dataset>/
 #   kaggle/model/<owner>__<model>/
 #   kaggle/dataset/<owner>__<dataset>/
-DEFAULT_DOWNLOAD_DIR = Path(os.getenv("MODEL_MANAGER_DOWNLOAD_DIR", str(Path.home() / "models"))).expanduser().resolve()
+DEFAULT_DOWNLOAD_DIR = Path(os.getenv("MODEL_MANAGER_DOWNLOAD_DIR", "<Your Model Directory>")).expanduser().resolve()
+INCOMING_DOWNLOAD_DIR = Path(os.getenv("MODEL_MANAGER_INCOMING_DIR", str(DEFAULT_DOWNLOAD_DIR / ".incoming"))).expanduser().resolve()
 CACHE_DIR = Path(os.getenv("MODEL_MANAGER_CACHE_DIR", str(Path.home() / ".cache" / "model_manager"))).expanduser().resolve()
 LEADERBOARD_CACHE_PATH = CACHE_DIR / "leaderboard_cache.json"
 REPUTATION_CACHE_PATH = CACHE_DIR / "publisher_reputation.json"
-DEFAULT_HF_DOWNLOAD_MAX_WORKERS = 8
+# huggingface_hub.snapshot_download writes a refs/<revision> stub to cache_dir even when
+# local_dir is set (the docstring claims cache_dir is unused but the code disagrees). Steer
+# those stubs into a throwaway dir so they never pollute HF_HUB_CACHE.
+HF_STUB_CACHE_DIR = CACHE_DIR / "hf_refs_stubs"
+DEFAULT_HF_DOWNLOAD_MAX_WORKERS = 2
 DEFAULT_HF_XET_RANGE_GETS = 16
-DEFAULT_HFDOWNLOADER_CONNECTIONS = 16
-DEFAULT_HFDOWNLOADER_MAX_ACTIVE = 4
+DEFAULT_HFDOWNLOADER_CONNECTIONS = 4
+DEFAULT_HFDOWNLOADER_MAX_ACTIVE = 1
+DEFAULT_DOWNLOAD_RETRY_ATTEMPTS = 4
+DEFAULT_DOWNLOAD_RETRY_BASE_DELAY_SECONDS = 3
 HFDOWNLOADER_SAFE_FILTER_ARTIFACT_TYPES = {"gguf", "gguf-split", "safetensors", "safetensors-sharded"}
+MULTIPART_ARTIFACT_TYPES = {"gguf-split", "safetensors-sharded"}
 HFDOWNLOADER_MODEL_EXCLUDE_TERMS = [
     ".ggml",
     ".safetensors",
@@ -125,20 +155,30 @@ HFDOWNLOADER_MODEL_EXCLUDE_TERMS = [
     ".hdf5",
     ".keras",
 ]
+DEFAULT_DEBUG_LOG_PATH = MODEL_TOOLS_DIR / "model_manager.debug.log"
+DEBUG_ENABLED = os.getenv("MODEL_MANAGER_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+DEBUG_LOG_PATH = Path(os.getenv("MODEL_MANAGER_DEBUG_LOG", "")).expanduser().resolve() if os.getenv("MODEL_MANAGER_DEBUG_LOG") else DEFAULT_DEBUG_LOG_PATH
+_OWNER_REPUTATION_CACHE: dict[str, set[str]] | None = None
 
 # Local pre-download risk intelligence. The script searches these files first, then any
-# likely risk workbook found in ~/model_tools. Supported formats: .json, .csv, .tsv, .xlsx
+# likely risk workbook found in <REDACTED_PATH> Supported formats: .json, .csv, .tsv, .xlsx
 # (.xlsx requires openpyxl).
 RISK_INTEL_CANDIDATES = [
+    MODEL_MANAGER_SCRIPT_DIR / "model_risk_intel.xlsx",
+    MODEL_MANAGER_SCRIPT_DIR / "model_risk_intel.csv",
+    MODEL_MANAGER_SCRIPT_DIR / "model_risk_intel.json",
     MODEL_TOOLS_DIR / "model_risk_intel.xlsx",
     MODEL_TOOLS_DIR / "model_risk_intel.csv",
     MODEL_TOOLS_DIR / "model_risk_intel.json",
+    MODEL_MANAGER_SCRIPT_DIR / "malicious_ai_models.xlsx",
+    MODEL_MANAGER_SCRIPT_DIR / "malicious_ai_models.csv",
     MODEL_TOOLS_DIR / "malicious_ai_models.xlsx",
     MODEL_TOOLS_DIR / "malicious_ai_models.csv",
+    MODEL_MANAGER_SCRIPT_DIR / "ai_model_risk_workbook.xlsx",
     MODEL_TOOLS_DIR / "ai_model_risk_workbook.xlsx",
 ]
 
-# Conservative defaults. Edit ~/.cache/model_manager/publisher_reputation.json for your own allow/warn/block lists.
+# Conservative defaults. Edit <REDACTED_PATH> for your own allow/warn/block lists.
 DEFAULT_KNOWN_GOOD_OWNERS = {
     "qwen", "deepseek-ai", "microsoft", "codellama", "meta-llama", "mistralai",
     "google", "google-bert", "nomic-ai", "jinaai", "sentence-transformers",
@@ -148,9 +188,11 @@ DEFAULT_WARN_NAME_TERMS = {
     "uncensored", "unsensored", "abliterated", "obliterated", "jailbreak",
     "backdoor", "backdoored", "poisoned", "eval-bypass", "bypass",
 }
-DEFAULT_EXCLUDED_AUTHORS = ["DavidAU", "TheBloke", "mradermacher", "bartowski"]
+DEFAULT_EXCLUDED_AUTHORS: list[str] = []
 DEFAULT_EXCLUDED_TERMS = ["uncensored", "nsfw", "roleplay", "erotic", "jailbreak"]
-MODEL_MANAGER_VERSION = "v1.8.1-artifact-picker-not-filter"
+MODEL_NAME_QUERY_TOKEN_RE = re.compile(r"[A-Za-z]{2,}[A-Za-z0-9._-]*\d[A-Za-z0-9._-]*")
+MAX_MODEL_NAME_TOKEN_VARIANTS = 12
+MODEL_MANAGER_VERSION = "v1.8.1-staged-cart-scan-fix"
 MODEL_FILE_EXTENSIONS = {".gguf", ".safetensors", ".bin", ".pt", ".pth", ".ckpt", ".onnx", ".mlmodel", ".mlpackage"}
 DATA_SAMPLE_EXTENSIONS = {".csv", ".json", ".jsonl", ".parquet", ".txt", ".tsv"}
 LFS_SIGNATURE = b"version https://git-lfs.github.com/spec/v1"
@@ -274,6 +316,7 @@ class SearchResult:
     recommendation: str = "-"
     duplicate_family: str | None = None
     duplicate_group_size: int = 1
+    whole_repo_selected: bool = False
 
 
 @dataclass
@@ -317,6 +360,17 @@ def human_size(num_bytes: int | None) -> str:
     return f"{size:.2f} PB"
 
 
+def size_range_label(size_range: tuple[int | None, int | None]) -> str:
+    lo, hi = size_range
+    if lo is None and hi is None:
+        return "any"
+    if lo is None:
+        return f"≤ {human_size(hi)}"
+    if hi is None:
+        return f"≥ {human_size(lo)}"
+    return f"{human_size(lo)} - {human_size(hi)}"
+
+
 SIZE_UNITS = {
     "b": 1,
     "byte": 1,
@@ -352,6 +406,20 @@ def parse_size_range(value: str) -> tuple[int | None, int | None] | None:
     raw = value.strip().lower()
     if raw in {"", "any", "all", "none", "no filter", "nofilter", "-"}:
         return (None, None)
+
+    # Single-sided upper bound: <X, <=X, under X, up to X, at most X
+    upper = re.fullmatch(r"(?:<=?|under\s+|up\s+to\s+|at\s+most\s+)\s*(.+)", raw)
+    if upper:
+        hi = parse_size_bytes(upper.group(1))
+        return (None, hi) if hi is not None else None
+
+    # Single-sided lower bound: >X, >=X, over X, above X, at least X, min X
+    lower = re.fullmatch(r"(?:>=?|over\s+|above\s+|at\s+least\s+|min(?:imum)?\s+)\s*(.+)", raw)
+    if lower:
+        lo = parse_size_bytes(lower.group(1))
+        return (lo, None) if lo is not None else None
+
+    # Two-sided range
     parts = [p.strip() for p in re.split(r"\s+(?:to|through)\s+|\s*-\s*", raw) if p.strip()]
     if len(parts) != 2:
         return None
@@ -367,19 +435,15 @@ def parse_size_range(value: str) -> tuple[int | None, int | None] | None:
 def prompt_model_size_range() -> tuple[int | None, int | None]:
     print()
     print("What size models do you want to see?")
-    print("Examples: 200 MB - 2 TB | 4 GB - 80 GB | any")
+    print("Examples: 200 MB - 2 TB | 4 GB - 80 GB | <8 GB | >50 GB | any")
     default = "200 MB - 2 TB"
     while True:
         value = prompt("Model size range", default)
         parsed = parse_size_range(value)
         if parsed is not None:
-            lo, hi = parsed
-            if lo is None and hi is None:
-                print("Model size filter: any")
-            else:
-                print(f"Model size filter: {human_size(lo)} - {human_size(hi)}")
+            print(f"Model size filter: {size_range_label(parsed)}")
             return parsed
-        print("Invalid size range. Include units, for example: 200 MB - 2 TB")
+        print("Invalid size range. Include units, for example: 200 MB - 2 TB or <8 GB")
 
 
 def parse_model_size_range_or_default(value: str | None) -> tuple[int | None, int | None] | None:
@@ -395,6 +459,22 @@ def parse_model_size_range_or_default(value: str | None) -> tuple[int | None, in
     else:
         print(f"Model size filter: {human_size(lo)} - {human_size(hi)}")
     return parsed
+
+
+def multipart_artifact_filter_relevant(selected_types: set[str]) -> bool:
+    return not selected_types or bool(selected_types & {"gguf", "safetensors"})
+
+
+def prompt_exclude_multipart_models(selected_types: set[str]) -> bool:
+    print()
+    families: list[str] = []
+    if not selected_types or "gguf" in selected_types:
+        families.append("GGUF split")
+    if not selected_types or "safetensors" in selected_types:
+        families.append("safetensors shard groups")
+    if families:
+        print("This hides split/sharded artifacts such as " + " and ".join(families) + ".")
+    return prompt_bool("Do you want to exclude multi-part models?", False)
 
 
 def size_in_range(size_bytes: int | None, size_range: tuple[int | None, int | None]) -> bool:
@@ -427,11 +507,122 @@ def env_int(name: str, default: int, minimum: int = 0) -> int:
         return default
 
 
+def env_int_if_set(name: str, minimum: int = 0) -> int | None:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return None
+    try:
+        return max(minimum, int(value.strip()))
+    except (TypeError, ValueError):
+        return None
+
+
+def download_retry_attempts() -> int:
+    return env_int("MODEL_MANAGER_DOWNLOAD_RETRIES", DEFAULT_DOWNLOAD_RETRY_ATTEMPTS, minimum=1)
+
+
+def download_retry_base_delay_seconds() -> int:
+    return env_int("MODEL_MANAGER_DOWNLOAD_RETRY_DELAY", DEFAULT_DOWNLOAD_RETRY_BASE_DELAY_SECONDS, minimum=1)
+
+
 def hf_xet_available() -> bool:
     return importlib.util.find_spec("hf_xet") is not None or shutil.which("hf-xet") is not None
 
 
-def configure_hf_download_environment(worker_count: int | None = None) -> dict[str, int | bool | str]:
+def selected_download_metrics(
+    result: SearchResult,
+    artifacts: list[Artifact] | None = None,
+) -> dict[str, int | None]:
+    unique_files: dict[str, int | None] = {}
+    source_files = result.files
+    if artifacts:
+        source_files = [item for art in artifacts for item in art.files]
+    for name, size in source_files or []:
+        unique_files[name] = size
+    total_size = sum(size or 0 for size in unique_files.values()) or result.size_bytes or 0
+    return {
+        "file_count": len(unique_files) or None,
+        "total_size": total_size or None,
+    }
+
+
+def recommend_hf_worker_count(
+    result: SearchResult,
+    artifacts: list[Artifact] | None = None,
+    safe_mode: bool = False,
+) -> int:
+    explicit = env_int_if_set("MODEL_MANAGER_HF_MAX_WORKERS", minimum=1)
+    if explicit is not None:
+        return explicit
+    if safe_mode:
+        return 1
+
+    metrics = selected_download_metrics(result, artifacts)
+    total_size = metrics["total_size"] or 0
+    file_count = metrics["file_count"] or 0
+    recommended = DEFAULT_HF_DOWNLOAD_MAX_WORKERS
+    if total_size >= 120 * 1024**3 or file_count >= 48:
+        recommended = 16
+    elif total_size >= 60 * 1024**3 or file_count >= 24:
+        recommended = 12
+    elif total_size >= 20 * 1024**3 or file_count >= 8:
+        recommended = 8
+    elif total_size >= 8 * 1024**3 or file_count >= 3:
+        recommended = 4
+    return min(max(1, recommended), 32)
+
+
+def recommend_hf_xet_range_gets(worker_count: int, safe_mode: bool = False) -> int:
+    explicit = env_int_if_set("MODEL_MANAGER_HF_XET_RANGE_GETS", minimum=1)
+    if explicit is not None:
+        return explicit
+    if safe_mode:
+        return 2
+    return min(max(DEFAULT_HF_XET_RANGE_GETS, worker_count * 2), 64)
+
+
+def recommend_hfdownloader_concurrency(
+    result: SearchResult,
+    artifacts: list[Artifact] | None = None,
+) -> tuple[int, int]:
+    explicit_connections = env_int_if_set("MODEL_MANAGER_HFD_CONNECTIONS", minimum=1)
+    explicit_active = env_int_if_set("MODEL_MANAGER_HFD_MAX_ACTIVE", minimum=1)
+    if explicit_connections is not None and explicit_active is not None:
+        return explicit_connections, explicit_active
+
+    metrics = selected_download_metrics(result, artifacts)
+    total_size = metrics["total_size"] or 0
+    file_count = metrics["file_count"] or 0
+
+    if total_size >= 120 * 1024**3:
+        recommended_connections = 16
+    elif total_size >= 60 * 1024**3:
+        recommended_connections = 12
+    elif total_size >= 20 * 1024**3:
+        recommended_connections = 8
+    else:
+        recommended_connections = DEFAULT_HFDOWNLOADER_CONNECTIONS
+
+    if file_count >= 24:
+        recommended_active = 6
+    elif file_count >= 8:
+        recommended_active = 4
+    elif file_count >= 3:
+        recommended_active = 2
+    else:
+        recommended_active = DEFAULT_HFDOWNLOADER_MAX_ACTIVE
+    if file_count <= 1:
+        recommended_active = 1
+
+    connections = explicit_connections if explicit_connections is not None else recommended_connections
+    max_active = explicit_active if explicit_active is not None else recommended_active
+    return min(max(1, connections), 32), min(max(1, max_active), 16)
+
+
+def configure_hf_download_environment(
+    worker_count: int | None = None,
+    range_gets: int | None = None,
+) -> dict[str, int | bool | str]:
     """Configure Hugging Face transfers before `huggingface_hub` is imported.
 
     Default mode uses Hugging Face's fast Xet transfer path. Set
@@ -442,7 +633,7 @@ def configure_hf_download_environment(worker_count: int | None = None) -> dict[s
     default_workers = 1 if safe_mode else DEFAULT_HF_DOWNLOAD_MAX_WORKERS
     default_range_gets = 2 if safe_mode else DEFAULT_HF_XET_RANGE_GETS
     max_workers = worker_count or env_int("MODEL_MANAGER_HF_MAX_WORKERS", default_workers, minimum=1)
-    range_gets = worker_count or env_int("MODEL_MANAGER_HF_XET_RANGE_GETS", default_range_gets, minimum=1)
+    range_gets = range_gets or env_int("MODEL_MANAGER_HF_XET_RANGE_GETS", default_range_gets, minimum=1)
 
     os.environ["HF_XET_CHUNK_CACHE_SIZE_BYTES"] = "0"
     os.environ["HF_XET_NUM_CONCURRENT_RANGE_GETS"] = str(range_gets)
@@ -463,7 +654,9 @@ def configure_hf_download_environment(worker_count: int | None = None) -> dict[s
 
 
 def hfdownloader_enabled() -> bool:
-    value = os.getenv("MODEL_MANAGER_HFDOWNLOADER", "1").strip().lower()
+    # Keep the newer Go downloader opt-in for now. The legacy
+    # snapshot_download path is simpler and matches the older working scripts.
+    value = os.getenv("MODEL_MANAGER_HFDOWNLOADER", "0").strip().lower()
     return value not in {"0", "false", "no", "off", "python"}
 
 
@@ -525,9 +718,50 @@ def quote_cmd(cmd: list[str]) -> str:
     return " ".join(shlex.quote(part) for part in cmd)
 
 
+def _debug_serialize(value: Any) -> str:
+    try:
+        return json.dumps(value, default=str, ensure_ascii=True)
+    except Exception:
+        return repr(value)
+
+
+def configure_debug_mode(enabled: bool, log_path: str | None = None) -> None:
+    global DEBUG_ENABLED, DEBUG_LOG_PATH
+    DEBUG_ENABLED = bool(enabled)
+    DEBUG_LOG_PATH = Path(log_path).expanduser().resolve() if log_path else DEFAULT_DEBUG_LOG_PATH
+
+
+def debug_log(event: str, **fields: Any) -> None:
+    payload = " ".join(f"{key}={_debug_serialize(value)}" for key, value in fields.items())
+    line = f"[DEBUG] {event}" + (f" {payload}" if payload else "")
+    if DEBUG_ENABLED:
+        print(line, file=sys.stderr)
+    if DEBUG_LOG_PATH is not None:
+        try:
+            DEBUG_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with DEBUG_LOG_PATH.open("a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+        except OSError:
+            pass
+
+
+class InputAborted(RuntimeError):
+    """Raised when interactive input is unavailable or intentionally cancelled."""
+
+
+def read_input(label: str) -> str:
+    try:
+        value = input(label)
+        debug_log("input", prompt=label, value=value)
+        return value
+    except (EOFError, KeyboardInterrupt) as exc:
+        debug_log("input-aborted", prompt=label, exc_type=type(exc).__name__)
+        raise InputAborted from exc
+
+
 def prompt(label: str, default: str | None = None) -> str:
     suffix = f" [{default}]" if default is not None else ""
-    value = input(f"{label}{suffix}: ").strip()
+    value = read_input(f"{label}{suffix}: ").strip()
     return value if value else (default or "")
 
 
@@ -656,6 +890,23 @@ def parse_repo_artifact_tokens(selection: str, results_count: int) -> list[tuple
     return out
 
 
+def parse_artifact_page_command(selection: str) -> tuple[str, int] | None:
+    """Parse commands like n2, p4, next 2, prev 4 for per-repo artifact paging."""
+    s = selection.strip().lower()
+    if not s:
+        return None
+    compact = re.fullmatch(r"(n|p)(\d+)", s)
+    if compact:
+        direction = "next" if compact.group(1) == "n" else "prev"
+        return direction, int(compact.group(2))
+    spaced = re.fullmatch(r"(n|next|p|prev|previous)\s+(\d+)", s)
+    if spaced:
+        token = spaced.group(1)
+        direction = "next" if token in {"n", "next"} else "prev"
+        return direction, int(spaced.group(2))
+    return None
+
+
 # -----------------------------------------------------------------------------
 # Query parsing and result merging
 # -----------------------------------------------------------------------------
@@ -726,6 +977,114 @@ def split_boolean_query(query: str) -> list[str]:
         if cleaned and cleaned.lower() not in seen:
             seen.add(cleaned.lower())
             out.append(cleaned)
+    return out
+
+
+def query_variant_dedupe_key(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value).strip().lower())
+
+
+def split_model_name_query_token(token: str) -> tuple[list[str], list[str], list[str]] | None:
+    raw = token.strip().strip('"\'')
+    if not raw or not MODEL_NAME_QUERY_TOKEN_RE.fullmatch(raw):
+        return None
+    first_digit = next((i for i, ch in enumerate(raw) if ch.isdigit()), -1)
+    if first_digit <= 0:
+        return None
+
+    prefix_words = re.findall(r"[A-Za-z]+", raw[:first_digit])
+    tail_parts = re.findall(r"[A-Za-z]+|\d+", raw[first_digit:])
+    if not prefix_words or not tail_parts:
+        return None
+
+    version_parts: list[str] = []
+    suffix_parts: list[str] = []
+    in_suffix = False
+    for part in tail_parts:
+        if not in_suffix and part.isdigit():
+            version_parts.append(part)
+            continue
+        in_suffix = True
+        suffix_parts.append(part)
+    if not version_parts:
+        return None
+    return prefix_words, version_parts, suffix_parts
+
+
+def model_name_token_variants(token: str) -> list[str]:
+    parsed = split_model_name_query_token(token)
+    if not parsed:
+        return [token]
+
+    prefix_words, version_parts, suffix_parts = parsed
+    if len(prefix_words) == 1:
+        prefix_variants = ["".join(prefix_words)]
+    else:
+        prefix_variants = ["-".join(prefix_words), "".join(prefix_words), " ".join(prefix_words)]
+
+    if len(version_parts) == 1:
+        version_variants = [version_parts[0]]
+    else:
+        version_variants = [".".join(version_parts), "-".join(version_parts), " ".join(version_parts)]
+
+    tail_variants: list[str] = []
+    if suffix_parts:
+        suffix_hyphen = "-".join(suffix_parts)
+        suffix_space = " ".join(suffix_parts)
+        suffix_compact = "".join(suffix_parts)
+        for version in version_variants:
+            tail_variants.append(f"{version}-{suffix_hyphen}")
+            tail_variants.append(f"{version} {suffix_space}")
+            if len(suffix_parts) == 1:
+                tail_variants.append(f"{version}{suffix_compact}")
+    else:
+        tail_variants.extend(version_variants)
+
+    candidates: list[str] = [token]
+    for prefix in prefix_variants:
+        for tail in tail_variants:
+            for joiner in ("", "-", " "):
+                candidates.append(f"{prefix}{joiner}{tail}".strip())
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in candidates:
+        key = query_variant_dedupe_key(item)
+        if key and key not in seen:
+            seen.add(key)
+            out.append(item)
+        if len(out) >= MAX_MODEL_NAME_TOKEN_VARIANTS:
+            break
+    return out or [token]
+
+
+def expand_search_terms_for_model_name_variants(search_terms: list[str]) -> list[str]:
+    """Expand mixed letter/number model names across common separator variants.
+
+    Examples:
+      GLM5.1 -> GLM-5.1, GLM5-1, GLM-5-1
+      Qwen3.6 -> Qwen-3.6, Qwen3-6, Qwen-3-6
+    """
+    expanded: list[str] = []
+    for term in search_terms:
+        base = term.strip()
+        if not base:
+            continue
+        expanded.append(base)
+        tokens = base.split()
+        for i, token in enumerate(tokens):
+            for variant in model_name_token_variants(token)[1:]:
+                replaced = tokens.copy()
+                replaced[i] = variant
+                expanded.append(" ".join(replaced))
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for term in expanded:
+        key = query_variant_dedupe_key(term)
+        if key not in seen:
+            seen.add(key)
+            out.append(term)
     return out
 
 
@@ -970,6 +1329,20 @@ def artifacts_for_display(result: SearchResult) -> list[Artifact]:
     return discover_artifacts(result)
 
 
+def artifact_is_multipart(artifact: Artifact) -> bool:
+    return artifact.artifact_type.lower() in MULTIPART_ARTIFACT_TYPES
+
+
+def apply_visible_artifacts(result: SearchResult, artifacts: list[Artifact]) -> None:
+    for i, art in enumerate(artifacts, 1):
+        art.index = i
+    result.visible_artifacts = artifacts
+    allowed_names = {name for art in artifacts for name, _ in art.files}
+    companion_names = {name for name, _ in result.files if any(fnmatch.fnmatch(name, pat) for pat in COMMON_MODEL_COMPANIONS)}
+    keep_names = allowed_names | companion_names
+    result.files = [(name, size) for name, size in result.files if name in keep_names]
+
+
 def refresh_hf_file_metadata(result: SearchResult) -> None:
     if result.source != "hf" or result.kind != "model":
         return
@@ -1006,14 +1379,7 @@ def filter_results_by_artifact_types(results: list[SearchResult], selected_types
         artifacts = discover_artifacts(r)
         matching = [a for a in artifacts if artifact_matches_selected_type(a, selected_types)]
         if matching:
-            for i, art in enumerate(matching, 1):
-                art.index = i
-            r.visible_artifacts = matching
-            # Keep only selected artifact families visible/selectable by pruning files to matching artifacts plus common companions.
-            allowed_names = {name for art in matching for name, _ in art.files}
-            companion_names = {name for name, _ in r.files if any(fnmatch.fnmatch(name, pat) for pat in COMMON_MODEL_COMPANIONS)}
-            keep_names = allowed_names | companion_names
-            r.files = [(name, size) for name, size in r.files if name in keep_names]
+            apply_visible_artifacts(r, matching)
             r.notes.append("artifact type match: " + ", ".join(sorted({a.artifact_type for a in matching})) + f"; {len(matching)} direct artifact option(s)")
             kept.append(r)
         else:
@@ -1045,12 +1411,7 @@ def filter_results_by_model_size(
                 continue
             matching = [a for a in artifacts if size_in_range(a.total_size, size_range)]
             if matching:
-                for i, art in enumerate(matching, 1):
-                    art.index = i
-                r.visible_artifacts = matching
-                allowed_names = {name for art in matching for name, _ in art.files}
-                companion_names = {name for name, _ in r.files if any(fnmatch.fnmatch(name, pat) for pat in COMMON_MODEL_COMPANIONS)}
-                r.files = [(name, size) for name, size in r.files if name in allowed_names or name in companion_names]
+                apply_visible_artifacts(r, matching)
                 r.notes.append(
                     f"model size match: {human_size(lo)} - {human_size(hi)}; {len(matching)} artifact option(s)"
                 )
@@ -1064,6 +1425,45 @@ def filter_results_by_model_size(
             removed += 1
     if removed:
         print(f"Filtered out {removed} model repo(s) outside size range: {human_size(lo)} - {human_size(hi)}")
+    return kept
+
+
+def filter_results_by_multipart_models(
+    results: list[SearchResult],
+    exclude_multipart_models: bool,
+) -> list[SearchResult]:
+    if not exclude_multipart_models:
+        return results
+    kept: list[SearchResult] = []
+    removed = 0
+    for r in results:
+        if r.kind != "model":
+            kept.append(r)
+            continue
+        if r.source != "hf":
+            r.notes.append("multi-part artifact layout not confirmed; provider does not expose reliable file metadata")
+            kept.append(r)
+            continue
+        refresh_hf_file_metadata(r)
+        artifacts = artifacts_for_display(r)
+        if not artifacts:
+            r.notes.append("multi-part artifact layout not confirmed; no recognized artifacts found")
+            kept.append(r)
+            continue
+        matching = [a for a in artifacts if not artifact_is_multipart(a)]
+        if matching:
+            apply_visible_artifacts(r, matching)
+            removed_types = sorted({a.artifact_type for a in artifacts if artifact_is_multipart(a)})
+            if removed_types:
+                r.notes.append("excluded multi-part artifact type(s): " + ", ".join(removed_types))
+            kept.append(r)
+            continue
+        removed += 1
+    if removed:
+        print(
+            f"Filtered out {removed} HF model repo(s) that only exposed multi-part artifacts "
+            "(for example gguf-split or safetensors-sharded)."
+        )
     return kept
 
 
@@ -1159,7 +1559,7 @@ def add_manual_leaderboard_cache(category: str) -> None:
     entries: dict[str, Any] = cache.setdefault("entries", {})
     rank = 1
     while True:
-        value = input(f"Leaderboard #{rank}: ").strip()
+        value = read_input(f"Leaderboard #{rank}: ").strip()
         if not value:
             break
         repo_id = parse_hf_repo_id(value)
@@ -1307,6 +1707,46 @@ def hf_api():
     return HfApi(token=os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACEHUB_API_TOKEN"))
 
 
+# Throttle between HF API metadata calls during search. Anonymous HF API limit is
+# ~500 req / 300s; a small per-call sleep keeps a 500-candidate scan under that.
+# Authenticated users (HF_TOKEN set) get much higher limits — set to 0 if needed.
+_HF_SEARCH_DELAY_S = env_int("MODEL_MANAGER_HF_SEARCH_DELAY_MS", 150, minimum=0) / 1000.0
+
+# Cap the total number of HF search-term variants expanded per query. The two
+# expanders (name variants × artifact suffixes) can produce 25+ terms per input,
+# each costing a list_models + N×model_info round-trip. A small cap keeps the API
+# load proportional to the actual base query. Set to a large number to disable.
+_HF_SEARCH_MAX_TERMS = env_int("MODEL_MANAGER_HF_SEARCH_MAX_TERMS", 5, minimum=1)
+
+
+def _hf_search_throttle() -> None:
+    if _HF_SEARCH_DELAY_S > 0:
+        time.sleep(_HF_SEARCH_DELAY_S)
+
+
+def _hf_call_with_retry(fn, *args, max_retries: int = 3, **kwargs):
+    """Call an HF API function with 429-aware retry. Honors Retry-After header."""
+    for attempt in range(max_retries + 1):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            response = getattr(e, "response", None)
+            status = getattr(response, "status_code", None) if response is not None else None
+            if status != 429 or attempt >= max_retries:
+                raise
+            retry_after = 30
+            try:
+                header = response.headers.get("Retry-After") if response is not None else None
+                if header:
+                    retry_after = max(1, int(float(header)))
+            except (TypeError, ValueError, AttributeError):
+                pass
+            authenticated = bool(os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACEHUB_API_TOKEN"))
+            tip = "" if authenticated else " (set HF_TOKEN to raise your limit; create one at https://huggingface.co/settings/tokens)"
+            print(f"  HF API 429 — sleeping {retry_after}s before retry {attempt + 1}/{max_retries}{tip}")
+            time.sleep(retry_after)
+
+
 def _repo_files_from_info(info: Any) -> tuple[int, list[tuple[str, int | None]]]:
     files: list[tuple[str, int | None]] = []
     total = 0
@@ -1373,9 +1813,9 @@ def search_hf_models(
     api = hf_api()
     fetch_limit = candidate_limit or limit
     try:
-        models = list(api.list_models(search=query, limit=fetch_limit, sort="downloads", full=True))
+        models = list(_hf_call_with_retry(api.list_models, search=query, limit=fetch_limit, sort="downloads", full=True))
     except TypeError:
-        models = list(api.list_models(search=query, limit=fetch_limit, full=True))
+        models = list(_hf_call_with_retry(api.list_models, search=query, limit=fetch_limit, full=True))
     results: list[SearchResult] = []
     for m in models:
         repo_id = getattr(m, "modelId", None) or getattr(m, "id", None)
@@ -1391,7 +1831,8 @@ def search_hf_models(
             continue
         notes: list[str] = []
         try:
-            info = api.model_info(repo_id=repo_id, files_metadata=True)
+            _hf_search_throttle()
+            info = _hf_call_with_retry(api.model_info, repo_id=repo_id, files_metadata=True)
             total, files = _repo_files_from_info(info)
             lic = _card_license(info)
         except Exception as e:
@@ -1421,7 +1862,7 @@ def search_hf_models(
 def search_hf_datasets(query: str, limit: int) -> list[SearchResult]:
     api = hf_api()
     try:
-        datasets = list(api.list_datasets(search=query, limit=limit, sort="downloads", full=True))
+        datasets = list(_hf_call_with_retry(api.list_datasets, search=query, limit=limit, sort="downloads", full=True))
     except Exception:
         from huggingface_hub import list_datasets
         datasets = list(list_datasets(search=query, limit=limit))
@@ -1432,7 +1873,8 @@ def search_hf_datasets(query: str, limit: int) -> list[SearchResult]:
             continue
         notes: list[str] = []
         try:
-            info = api.dataset_info(repo_id=repo_id, files_metadata=True)
+            _hf_search_throttle()
+            info = _hf_call_with_retry(api.dataset_info, repo_id=repo_id, files_metadata=True)
             total, files = _repo_files_from_info(info)
             lic = _card_license(info)
         except Exception as e:
@@ -1868,6 +2310,21 @@ def owner_of(repo_id: str) -> str:
     return repo_id.split("/", 1)[0].lower() if "/" in repo_id else repo_id.lower()
 
 
+def normalize_owner_name(value: Any) -> str:
+    text = str(value).strip().strip("\"'").lower()
+    if not text:
+        return ""
+    text = re.sub(r"^@", "", text)
+    text = re.sub(r"^(publisher:|owner:|author:|creator:)", "", text)
+    parsed_repo = parse_hf_repo_id(text)
+    if parsed_repo:
+        return owner_of(parsed_repo)
+    if "/" in text and not text.startswith("http"):
+        text = text.split("/", 1)[0]
+    text = re.sub(r"[^a-z0-9._-]+", "-", text).strip("-")
+    return text
+
+
 def family_key(repo_id: str) -> str:
     """Best-effort model family key for duplicate/mirror detection."""
     name = repo_id.split("/", 1)[-1].lower()
@@ -2060,9 +2517,10 @@ def exclude_model_families_interactive(results: list[SearchResult]) -> list[Sear
 
 def annotate_recommendations(results: list[SearchResult]) -> None:
     cfg = load_reputation_config()
-    good = {str(x).lower() for x in cfg.get("known_good_owners", [])}
-    bad = {str(x).lower() for x in cfg.get("known_malicious_owners", [])}
-    warn_owners = {str(x).lower() for x in cfg.get("warn_owners", [])}
+    reputation = load_owner_reputation_sets()
+    good = reputation["known_good_owners"]
+    bad = reputation["known_malicious_owners"]
+    warn_owners = reputation["warn_owners"]
     warn_terms = {str(x).lower() for x in cfg.get("warn_name_terms", [])}
 
     groups: dict[str, list[SearchResult]] = {}
@@ -2100,12 +2558,19 @@ def annotate_recommendations(results: list[SearchResult]) -> None:
             rec = "LowSignal"
             r.notes.append("large repo with very low downloads/likes; review card and files carefully")
         if r.duplicate_group_size > 1 and rec not in {"BlockOwner", "WarnOwner", "WarnName"}:
-            rec = "DupFamily" if rec == "Unknown" else rec
+            if rec == "Unknown":
+                rec = "Duplicate Families"
+            elif rec == "KnownGood":
+                rec = "KnownGood/DF"
         r.recommendation = rec
 
 
 def hide_duplicate_families(results: list[SearchResult]) -> list[SearchResult]:
     """Keep the strongest candidate in each likely duplicate family, preserving non-models."""
+    reputation = load_owner_reputation_sets()
+    good_owners = reputation["known_good_owners"]
+    bad_owners = reputation["known_malicious_owners"]
+    warn_owners = reputation["warn_owners"]
     best: dict[str, SearchResult] = {}
     hidden: dict[str, list[SearchResult]] = {}
     passthrough: list[SearchResult] = []
@@ -2114,9 +2579,12 @@ def hide_duplicate_families(results: list[SearchResult]) -> list[SearchResult]:
             passthrough.append(r)
             continue
         key = r.duplicate_family
+        owner = owner_of(r.repo_id)
         score = (
+            0 if owner in bad_owners else 1,
+            0 if owner in warn_owners else 1,
+            1 if owner in good_owners else 0,
             1 if r.leaderboard_rank is not None else 0,
-            1 if owner_of(r.repo_id) in DEFAULT_KNOWN_GOOD_OWNERS else 0,
             r.downloads or 0,
             r.likes or 0,
             r.size_bytes or 0,
@@ -2125,9 +2593,12 @@ def hide_duplicate_families(results: list[SearchResult]) -> list[SearchResult]:
         if cur is None:
             best[key] = r
             continue
+        cur_owner = owner_of(cur.repo_id)
         cur_score = (
+            0 if cur_owner in bad_owners else 1,
+            0 if cur_owner in warn_owners else 1,
+            1 if cur_owner in good_owners else 0,
             1 if cur.leaderboard_rank is not None else 0,
-            1 if owner_of(cur.repo_id) in DEFAULT_KNOWN_GOOD_OWNERS else 0,
             cur.downloads or 0,
             cur.likes or 0,
             cur.size_bytes or 0,
@@ -2145,6 +2616,63 @@ def hide_duplicate_families(results: list[SearchResult]) -> list[SearchResult]:
     return kept
 
 
+def duplicate_family_reputation_recommendation(results: list[SearchResult]) -> dict[str, Any]:
+    merged = merge_search_results(results)
+    groups: dict[str, list[SearchResult]] = {}
+    for result in merged:
+        if result.kind == "model":
+            groups.setdefault(family_key(result.repo_id), []).append(result)
+    duplicate_groups = {family: items for family, items in groups.items() if len(items) > 1}
+    reputation = load_owner_reputation_sets()
+    good_owners = reputation["known_good_owners"]
+    bad_owners = reputation["known_malicious_owners"]
+    warn_owners = reputation["warn_owners"]
+
+    preferred: set[str] = set()
+    risky: set[str] = set()
+    caution: set[str] = set()
+    for items in duplicate_groups.values():
+        owners = {owner_of(item.repo_id) for item in items}
+        preferred.update(owner for owner in owners if owner in good_owners)
+        risky.update(owner for owner in owners if owner in bad_owners)
+        caution.update(owner for owner in owners if owner in warn_owners and owner not in bad_owners)
+
+    return {
+        "duplicate_group_count": len(duplicate_groups),
+        "preferred_owners": sorted(preferred),
+        "risky_owners": sorted(risky),
+        "warn_owners": sorted(caution),
+        "default_hide": bool(preferred or risky or caution),
+    }
+
+
+def prompt_hide_duplicate_families_preference(results: list[SearchResult]) -> bool:
+    suggestion = duplicate_family_reputation_recommendation(results)
+    duplicate_group_count = int(suggestion["duplicate_group_count"])
+    if duplicate_group_count <= 0:
+        return False
+
+    print()
+    print(f"Found {duplicate_group_count} likely duplicate/mirror family group(s) in the current results.")
+    preferred_owners = suggestion["preferred_owners"]
+    risky_owners = suggestion["risky_owners"]
+    warn_owners = suggestion["warn_owners"]
+    if preferred_owners or risky_owners or warn_owners:
+        print("Local author reputation hint:")
+        if preferred_owners:
+            print("  Known-good owners in duplicate families: " + ", ".join(preferred_owners[:8]))
+        if risky_owners:
+            print("  Owners flagged malicious in duplicate families: " + ", ".join(risky_owners[:8]))
+        elif warn_owners:
+            print("  Owners flagged warn/suspicious in duplicate families: " + ", ".join(warn_owners[:8]))
+        if suggestion["default_hide"]:
+            print("  Recommendation: yes, hide duplicates to prefer higher-trust owners.")
+    return prompt_bool(
+        "Hide likely duplicate/mirror repos by exact variant family?",
+        bool(suggestion["default_hide"]),
+    )
+
+
 def result_size_label(result: SearchResult) -> str:
     if result.kind == "model" and result.visible_artifacts:
         sizes = [a.total_size for a in result.visible_artifacts if a.total_size]
@@ -2155,6 +2683,74 @@ def result_size_label(result: SearchResult) -> str:
                 return human_size(lo)
             return f"{human_size(lo)}-{human_size(hi)}"
     return human_size(result.size_bytes)
+
+
+def selection_queue_size_label(result: SearchResult) -> str:
+    if result.selected_artifacts:
+        sizes = [a.total_size for a in result.selected_artifacts if a.total_size]
+        if sizes:
+            lo = min(sizes)
+            hi = max(sizes)
+            if lo == hi:
+                return human_size(lo)
+            return f"{human_size(lo)}-{human_size(hi)}"
+    return result_size_label(result)
+
+
+def selection_queue_detail(result: SearchResult) -> str:
+    if result.selected_artifacts:
+        return ", ".join(f"{result.index}{alpha_label(a.index)} {a.label}" for a in result.selected_artifacts)
+    if result.whole_repo_selected:
+        return "WHOLE REPO"
+    return ""
+
+
+def clear_selection_state(result: SearchResult) -> None:
+    result.selected_artifacts.clear()
+    result.whole_repo_selected = False
+
+
+def review_download_queue(results: list[SearchResult]) -> list[SearchResult]:
+    queue = list(results)
+    while queue:
+        print()
+        print("Selections queued for download:")
+        for pos, result in enumerate(queue, 1):
+            size_label = selection_queue_size_label(result)
+            detail = selection_queue_detail(result)
+            print(f"  {pos}. [repo {result.index}] {result.source}:{result.kind} {size_label} {result.repo_id}")
+            if detail:
+                print(f"      selected: {detail}")
+        if not prompt_bool("Do you want to remove any selections before download?", False):
+            return queue
+
+        raw = read_input("Queue number(s) to remove, or 'all': ").strip().lower()
+        if not raw or raw in {"none", "n", "no", "skip"}:
+            print("No selections removed.")
+            continue
+        if raw == "all":
+            for result in queue:
+                clear_selection_state(result)
+            print("Removed all queued selections.")
+            return []
+
+        nums = parse_selection(raw, len(queue))
+        if not nums:
+            print("No valid queue numbers entered. Nothing removed.")
+            continue
+
+        remove_set = set(nums)
+        kept: list[SearchResult] = []
+        removed_labels: list[str] = []
+        for pos, result in enumerate(queue, 1):
+            if pos in remove_set:
+                removed_labels.append(result.repo_id)
+                clear_selection_state(result)
+            else:
+                kept.append(result)
+        queue = kept
+        print(f"Removed {len(removed_labels)} selection(s): {', '.join(removed_labels)}")
+    return []
 
 
 def show_artifact_picker_for_repo(result: SearchResult) -> bool:
@@ -2183,6 +2779,7 @@ def show_artifact_picker_for_repo(result: SearchResult) -> bool:
         return False
     if mode == "whole_repo":
         if prompt_bool(f"Whole repo is {human_size(result.size_bytes)}. Select whole repo?", False):
+            result.whole_repo_selected = True
             return True
         return False
     nums = parse_selection(prompt("Which artifact numbers? Examples: 1, 1,3, 2-4, all"), len(artifacts))
@@ -2195,36 +2792,60 @@ def show_artifact_picker_for_repo(result: SearchResult) -> bool:
             print(f"Selected: {result.index}{alpha_label(art.index)} {art.label} ({human_size(art.total_size)})")
     return True
 
-def print_results_page(results: list[SearchResult], start: int, page_size: int, show_files: bool = True, top_files: int = 7) -> None:
+def print_results_page(
+    results: list[SearchResult],
+    start: int,
+    page_size: int,
+    show_files: bool = True,
+    top_files: int = 7,
+    artifact_offsets: dict[int, int] | None = None,
+) -> None:
     end = min(start + page_size, len(results))
+    rec_width = 18
     print()
     print(f"Results {start + 1}-{end} of {len(results)}")
-    print(f"{'#':>4}  {'SRC':<7}  {'KIND':<7}  {'FAMILY':<18}  {'LB':<16}  {'REC':<12}  {'SIZE':>12}  {'DL':>10}  {'LIKES':>7}  {'TYPE':<22}  {'LICENSE':<14}  REPO")
-    print("-" * 185)
+    print(f"{'#':>4}  {'SRC':<7}  {'KIND':<7}  {'FAMILY':<18}  {'LB':<16}  {'REC':<{rec_width}}  {'SIZE':>12}  {'DL':>10}  {'LIKES':>7}  {'TYPE':<22}  {'LICENSE':<14}  REPO")
+    print("-" * 192)
     for r in results[start:end]:
         lb = r.leaderboard_label or "-"
         rec = r.recommendation or "-"
         fam = model_family_key(r.repo_id) if r.kind == "model" else "-"
-        print(f"{r.index:>4}  {r.source:<7}  {r.kind:<7}  {fam:<18.18}  {lb:<16.16}  {rec:<12.12}  {result_size_label(r):>12}  {str(r.downloads if r.downloads is not None else '-'):>10}  {str(r.likes if r.likes is not None else '-'):>7}  {(r.pipeline or '-'):<22.22}  {(r.license or '-'):<14.14}  {r.repo_id}")
+        print(f"{r.index:>4}  {r.source:<7}  {r.kind:<7}  {fam:<18.18}  {lb:<16.16}  {rec:<{rec_width}.{rec_width}}  {result_size_label(r):>12}  {str(r.downloads if r.downloads is not None else '-'):>10}  {str(r.likes if r.likes is not None else '-'):>7}  {(r.pipeline or '-'):<22.22}  {(r.license or '-'):<14.14}  {r.repo_id}")
         if r.title:
             print(f"      title: {r.title}")
         if r.notes:
             for note in r.notes:
                 print(f"      note: {note}")
+        if r.selected_artifacts:
+            labels = ", ".join(f"{r.index}{alpha_label(a.index)} {a.label}" for a in r.selected_artifacts)
+            print(f"      selected: {labels}")
+        elif r.whole_repo_selected:
+            print("      selected: WHOLE REPO")
         if show_files:
             if r.source == "hf" and r.kind == "model":
                 refresh_hf_file_metadata(r)
                 artifacts = artifacts_for_display(r)
                 if artifacts:
+                    offset = 0
+                    if artifact_offsets is not None:
+                        max_offset = max(0, ((len(artifacts) - 1) // top_files) * top_files)
+                        offset = min(max(0, artifact_offsets.get(r.index, 0)), max_offset)
+                    shown_artifacts = artifacts[offset: offset + top_files]
                     print("      direct artifacts — select these with IDs like 1A/1B; repo number opens the artifact picker")
-                    for art in artifacts[:top_files]:
+                    for art in shown_artifacts:
                         child_id = f"{r.index}{alpha_label(art.index)}"
                         quant = art.quant or "-"
                         first_file = art.files[0][0] if art.files else art.label
                         extra = f" +{len(art.files) - 1} files" if len(art.files) > 1 else ""
                         print(f"   {child_id + '.':<7} {human_size(art.total_size):>12}  {art.artifact_type:<20} {quant:<10} {first_file}{extra}")
                     if len(artifacts) > top_files:
-                        print(f"           ... {len(artifacts) - top_files} more artifacts; select repo {r.index} to see all")
+                        shown_start = offset + 1
+                        shown_end = min(len(artifacts), offset + top_files)
+                        print(f"           showing artifacts {shown_start}-{shown_end} of {len(artifacts)}")
+                        if shown_end < len(artifacts):
+                            print(f"           ... {len(artifacts) - shown_end} more artifacts; press n{r.index} for more here or select repo {r.index} to see all")
+                        elif offset > 0:
+                            print(f"           ... press p{r.index} to go back or select repo {r.index} to see all")
                 elif r.files:
                     print("      no direct GGUF/Core ML/etc. artifact detected in current file metadata; sample files:")
                     for fname, fsize in r.files[:top_files]:
@@ -2241,35 +2862,161 @@ def paged_select(results: list[SearchResult], page_size: int = 20) -> list[Searc
     pos = 0
     selected: set[int] = set()
     excluded: set[int] = set()
+    artifact_offsets: dict[int, int] = {}
     while True:
-        visible = [r for r in results if r.index not in selected and r.index not in excluded]
-        if not visible:
-            print("No unselected results remain.")
+        browseable = [r for r in results if r.index not in excluded]
+        unselected = [r for r in browseable if r.index not in selected]
+        debug_log(
+            "paged-select-loop",
+            pos=pos,
+            page_size=page_size,
+            total_results=len(results),
+            browseable_indexes=[r.index for r in browseable],
+            unselected_indexes=[r.index for r in unselected],
+            selected_indexes=sorted(selected),
+            excluded_indexes=sorted(excluded),
+            artifact_offsets=artifact_offsets,
+        )
+        if not browseable:
+            if selected:
+                print("No results remain visible. Continuing to the download step for the current selection cart.")
+            else:
+                print("No results remain visible.")
             break
-        pos = min(pos, max(0, len(visible) - page_size))
-        print_results_page(visible, pos, page_size)
-        print("Commands: artifact IDs like 1A,2C | repo numbers 1,3 or 2-6 | xpub qwen exclude publisher | xf 7 / xfam qwen coder exclude family | n next | p previous | all | done | q")
-        cmd = input("Which repo number(s), artifact ID(s), or family exclusion do you want? ").strip()
+        if not unselected and selected:
+            print("All visible results are already in the selection cart. Continuing to the download step for the current selection cart.")
+            break
+        max_pos = max(0, ((len(browseable) - 1) // page_size) * page_size)
+        pos = min(pos, max_pos)
+        current_page = browseable[pos:min(pos + page_size, len(browseable))]
+        artifact_page_targets: list[tuple[SearchResult, int]] = []
+        for candidate in current_page:
+            if candidate.source != "hf" or candidate.kind != "model":
+                continue
+            refresh_hf_file_metadata(candidate)
+            artifacts = artifacts_for_display(candidate)
+            if len(artifacts) <= 7:
+                continue
+            max_offset = max(0, ((len(artifacts) - 1) // 7) * 7)
+            artifact_offsets[candidate.index] = min(max(0, artifact_offsets.get(candidate.index, 0)), max_offset)
+            artifact_page_targets.append((candidate, max_offset))
+        print_results_page(browseable, pos, page_size, artifact_offsets=artifact_offsets)
+        if selected:
+            print(f"Selection cart: {len(selected)} repo(s) selected. Selected repos stay visible and are marked in the list; use `cart` or `remove` to adjust.")
+            print("Press Enter / type `done` to start downloading, or keep browsing the full results.")
+        if pos + page_size >= len(browseable):
+            if excluded:
+                print(f"This is all of the currently visible models. {len(excluded)} result(s) are excluded from view.")
+            else:
+                print("This is all of the models the search found.")
+        if artifact_page_targets:
+            pageable_ids = ", ".join(str(r.index) for r, _ in artifact_page_targets)
+            print(f"More artifact rows are available on this screen for repo(s): {pageable_ids}. Use n<repo> / p<repo>, for example n{artifact_page_targets[0][0].index}.")
+            print("Commands: artifact IDs like 1A,2C | repo numbers open artifact picker | whole 1 | cart/remove/clear | xpub qwen | xf 7 / xfam qwen coder | n/p changes result pages | n2/p2 page artifact rows for repo 2 | Enter/done starts download | q")
+        else:
+            print("Commands: artifact IDs like 1A,2C | repo numbers open artifact picker | whole 1 | cart/remove/clear | xpub qwen | xf 7 / xfam qwen coder | n/p | Enter/done starts download | q")
+        prompt_label = (
+            "Add more repo/artifact IDs, or press Enter / type 'done' to start download"
+            if selected else
+            "Which repo number(s), artifact ID(s), or family exclusion do you want?"
+        )
+        cmd = read_input(f"{prompt_label} ").strip()
         cmd_lower = cmd.lower()
+        debug_log("paged-select-command", cmd=cmd, cmd_lower=cmd_lower, pos=pos, selected_indexes=sorted(selected))
+        if not cmd_lower and selected:
+            break
         if cmd_lower in {"q", "quit", "exit"}:
             return []
         if cmd_lower in {"done", "d"}:
             break
+        artifact_page_cmd = parse_artifact_page_command(cmd_lower)
+        if artifact_page_cmd:
+            direction, repo_num = artifact_page_cmd
+            target_info = next(((target, target_max_offset) for target, target_max_offset in artifact_page_targets if target.index == repo_num), None)
+            if target_info is None:
+                print(f"Repo {repo_num} on this page does not have additional hidden artifact rows. Use the repo number to open its full artifact picker.")
+                continue
+            target, target_max_offset = target_info
+            current_offset = artifact_offsets.get(repo_num, 0)
+            debug_log(
+                "artifact-page-command",
+                direction=direction,
+                repo_num=repo_num,
+                current_offset=current_offset,
+                target_max_offset=target_max_offset,
+            )
+            if direction == "next":
+                if current_offset < target_max_offset:
+                    artifact_offsets[repo_num] = min(target_max_offset, current_offset + 7)
+                    print(f"Showing more artifact rows for repo {repo_num}.")
+                else:
+                    print(f"Already showing the last artifact rows for repo {repo_num}.")
+            else:
+                if current_offset > 0:
+                    artifact_offsets[repo_num] = max(0, current_offset - 7)
+                    print(f"Showing earlier artifact rows for repo {repo_num}.")
+                else:
+                    print(f"Already showing the first artifact rows for repo {repo_num}.")
+            continue
+        if cmd_lower in {"cart", "selected", "selection"}:
+            cart = [r for r in results if r.index in selected]
+            if not cart:
+                print("Selection cart is empty.")
+            else:
+                print("Selection cart:")
+                for r in cart:
+                    if r.selected_artifacts:
+                        labels = ", ".join(f"{r.index}{alpha_label(a.index)} {a.label}" for a in r.selected_artifacts)
+                        print(f"  {r.index}. {r.repo_id}: {labels}")
+                    elif r.whole_repo_selected:
+                        print(f"  {r.index}. {r.repo_id}: WHOLE REPO")
+                    else:
+                        print(f"  {r.index}. {r.repo_id}")
+            continue
+        if cmd_lower.startswith("remove "):
+            nums = parse_selection(cmd_lower.split(maxsplit=1)[1], len(results))
+            for n in nums:
+                if 1 <= n <= len(results):
+                    selected.discard(n)
+                    results[n - 1].selected_artifacts.clear()
+                    results[n - 1].whole_repo_selected = False
+            print(f"Selection cart now has {len(selected)} item(s).")
+            continue
+        if cmd_lower in {"clear", "clear-cart"}:
+            for r in results:
+                r.selected_artifacts.clear()
+                r.whole_repo_selected = False
+            selected.clear()
+            print("Selection cart cleared.")
+            continue
         if cmd_lower in {"n", "next"}:
-            max_pos = max(0, len(visible) - page_size)
             if pos >= max_pos:
-                print("Already at the last page. Use artifact IDs/repo numbers, 'done', or 'q'.")
+                if excluded:
+                    print(f"This is all of the currently visible models. {len(excluded)} result(s) are excluded from view.")
+                else:
+                    print("This is all of the models the search found.")
+                if artifact_page_targets:
+                    print(f"Use n<repo>/p<repo> for artifact rows on repo(s): {pageable_ids}.")
+                else:
+                    print("Use artifact IDs/repo numbers, press Enter for download, or 'q'.")
+                debug_log("result-page-next-blocked", pos=pos, max_pos=max_pos, pageable_ids=pageable_ids if artifact_page_targets else [])
             else:
                 pos = min(max_pos, pos + page_size)
+                debug_log("result-page-next", new_pos=pos, max_pos=max_pos)
             continue
         if cmd_lower in {"p", "prev", "previous"}:
             if pos <= 0:
-                print("Already at the first page.")
+                if artifact_page_targets:
+                    print(f"Already at the first result page. Use n<repo>/p<repo> for artifact rows on repo(s): {pageable_ids}.")
+                else:
+                    print("Already at the first page.")
+                debug_log("result-page-prev-blocked", pos=pos, pageable_ids=pageable_ids if artifact_page_targets else [])
             else:
                 pos = max(0, pos - page_size)
+                debug_log("result-page-prev", new_pos=pos)
             continue
         if cmd_lower in {"families", "family", "top"}:
-            print_top_model_families([r for r in results if r.index not in selected])
+            print_top_model_families(browseable)
             continue
         if cmd_lower.startswith("xf ") or cmd_lower.startswith("exclude-family "):
             token = cmd_lower.split(maxsplit=1)[1].strip()
@@ -2316,13 +3063,12 @@ def paged_select(results: list[SearchResult], page_size: int = 20) -> list[Searc
                     r = results[n - 1]
                     if prompt_bool(f"Select WHOLE repo {n}: {r.repo_id} ({human_size(r.size_bytes)})?", False):
                         selected.add(r.index)
-            if prompt_bool("Done selecting?", False):
-                break
-            pos = 0
+            print("Added to cart. Press Enter or type 'done' to start the download step, or enter more IDs to add.")
             continue
 
         artifact_tokens = parse_repo_artifact_tokens(cmd, len(results))
         if artifact_tokens:
+            debug_log("artifact-token-selection", artifact_tokens=artifact_tokens)
             for repo_num, art_num in artifact_tokens:
                 r = results[repo_num - 1]
                 artifacts = artifacts_for_display(r)
@@ -2340,29 +3086,24 @@ def paged_select(results: list[SearchResult], page_size: int = 20) -> list[Searc
                     r.selected_artifacts.append(art)
                 selected.add(repo_num)
                 print(f"Selected artifact {repo_num}{alpha_label(art_num)}: {r.repo_id} -> {art.label} ({human_size(art.total_size)})")
-            if prompt_bool("Done selecting?", False):
-                break
-            pos = 0
+            print("Added to cart. Press Enter or type 'done' to start the download step, or enter more IDs to add.")
             continue
 
         if cmd_lower == "all":
-            nums = [r.index for r in visible]
+            nums = [r.index for r in browseable if r.index not in selected]
         else:
             nums = parse_selection(cmd_lower, len(results))
         if nums:
+            debug_log("repo-number-selection", nums=nums)
             for n in nums:
                 if not (1 <= n <= len(results)):
                     continue
                 r = results[n - 1]
-                if r.index in selected:
-                    continue
                 keep = show_artifact_picker_for_repo(r)
                 if keep:
                     selected.add(r.index)
-            print(f"Selected repos/artifacts: {', '.join(str(n) for n in sorted(selected))}")
-            if prompt_bool("Done selecting?", False):
-                break
-            pos = 0
+            print(f"Selection cart: {', '.join(str(n) for n in sorted(selected))}")
+            print("Press Enter or type 'done' to start the download step, or enter more IDs to add.")
             continue
     return [r for r in results if r.index in selected]
 
@@ -2566,7 +3307,7 @@ def delete_path_after_confirmation(path: Path, reason: str) -> bool:
     print(f"Path: {path}")
     print(f"Reason: {reason}")
     print("Deletion is permanent for normal filesystem use.")
-    confirm = input("Delete this downloaded item? [y/N]: ").strip().lower()
+    confirm = read_input("Delete this downloaded item? [y/N]: ").strip().lower()
     if confirm not in {"y", "yes"}:
         print("Keeping files.")
         return False
@@ -2678,10 +3419,17 @@ def find_tool_command(path: Path, target: Path) -> ScannerCommand | None:
 
 
 def run_external_security_tools(target: Path) -> list[dict[str, str]]:
+    """Run external scanners against one path, streaming output instead of buffering it.
+
+    Scanner failures are scanner WARNs, not model DANGERs. A model should only become
+    DANGER/BLOCKER when a scanner output contains a clear high-risk finding.
+    """
     findings: list[dict[str, str]] = []
-    if not prompt_bool("Run external security/audit tools against the download?", True):
+    if not prompt_bool("Run external security/audit tools against the staged download?", True):
         return findings
     seen_commands: set[tuple[str, ...]] = set()
+    high_risk_re = re.compile(r"\b(malware|malicious|backdoor|rce|remote code execution|trojan|stealer|exploit)\b", re.I)
+    low_signal_re = re.compile(r"(unrecognized arguments|usage:|error: argument|invalid option|unknown option)", re.I)
     for tool in DEFAULT_SECURITY_TOOLS:
         scanner = find_tool_command(tool, target)
         if not scanner:
@@ -2694,16 +3442,45 @@ def run_external_security_tools(target: Path) -> list[dict[str, str]]:
         seen_commands.add(cmd_key)
         print()
         print(f"Running read-only scanner command ({scanner.label}): {quote_cmd(scanner.cmd)}")
+        risky_hits: list[str] = []
+        recent_lines: list[str] = []
+        saw_invocation_error = False
         try:
-            proc = subprocess.run(scanner.cmd, text=True, capture_output=True, timeout=1800, cwd=str(scanner.cwd) if scanner.cwd else None)
-            output = (proc.stdout or "") + "\n" + (proc.stderr or "")
-            print(output[-4000:] if output.strip() else f"Tool exit code: {proc.returncode}")
-            if proc.returncode not in (0, None):
-                findings.append({"severity": "DANGER", "message": f"scanner reported non-zero exit from {scanner.label}: rc={proc.returncode}"})
-            if re.search(r"malware|malicious|backdoor|rce|remote code execution", output, re.I):
-                findings.append({"severity": "DANGER", "message": f"scanner output contains high-risk language from {scanner.label}"})
+            proc = subprocess.Popen(
+                scanner.cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                cwd=str(scanner.cwd) if scanner.cwd else None,
+            )
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                clean = line.rstrip("\n")
+                print(clean)
+                if len(recent_lines) >= 80:
+                    recent_lines.pop(0)
+                recent_lines.append(clean)
+                if low_signal_re.search(clean):
+                    saw_invocation_error = True
+                if high_risk_re.search(clean):
+                    risky_hits.append(clean[:300])
+            rc = proc.wait(timeout=10)
+            if rc not in (0, None):
+                if saw_invocation_error:
+                    findings.append({"severity": "WARN", "message": f"scanner invocation error from {scanner.label}: rc={rc}"})
+                elif risky_hits:
+                    findings.append({"severity": "HIGH", "message": f"scanner {scanner.label} returned rc={rc} with high-risk language; review output"})
+                else:
+                    findings.append({"severity": "WARN", "message": f"scanner reported non-zero exit from {scanner.label}: rc={rc}"})
+            for hit in risky_hits[:5]:
+                findings.append({"severity": "HIGH", "message": f"scanner output high-risk term from {scanner.label}: {hit}"})
         except subprocess.TimeoutExpired:
             findings.append({"severity": "WARN", "message": f"scanner timed out: {scanner.label}"})
+            try:
+                proc.kill()  # type: ignore[name-defined]
+            except Exception:
+                pass
         except Exception as e:
             findings.append({"severity": "WARN", "message": f"scanner failed {scanner.label}: {type(e).__name__}: {e}"})
     return findings
@@ -2711,6 +3488,105 @@ def run_external_security_tools(target: Path) -> list[dict[str, str]]:
 # -----------------------------------------------------------------------------
 # Download
 # -----------------------------------------------------------------------------
+
+
+def final_download_path(result: SearchResult, download_root: Path) -> Path:
+    return download_root / ("huggingface" if result.source == "hf" else "kaggle") / result.kind / safe_folder_name(result.repo_id)
+
+
+def partial_download_name(result: SearchResult) -> str:
+    digest = hashlib.sha1(f"{result.source}:{result.kind}:{result.repo_id}".encode("utf-8")).hexdigest()[:10]
+    return f"{safe_folder_name(result.repo_id)}.{digest}.partial"
+
+
+def staging_download_path(result: SearchResult, download_root: Path) -> Path:
+    incoming_root = Path(os.getenv("MODEL_MANAGER_INCOMING_DIR", str(download_root / ".incoming"))).expanduser().resolve()
+    provider_root = incoming_root / ("huggingface" if result.source == "hf" else "kaggle") / result.kind
+    preferred = provider_root / partial_download_name(result)
+    if preferred.exists():
+        return preferred
+
+    legacy_prefix = safe_folder_name(result.repo_id)
+    try:
+        legacy_candidates = sorted(
+            provider_root.glob(f"{legacy_prefix}*.partial"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        legacy_candidates = []
+    for candidate in legacy_candidates:
+        if candidate.exists():
+            return candidate
+    return preferred
+
+
+def looks_like_permanent_download_error(error: BaseException) -> bool:
+    message = f"{type(error).__name__}: {error}".lower()
+    permanent_markers = [
+        "401",
+        "403",
+        "404",
+        "repository not found",
+        "revision not found",
+        "gated repo",
+        "invalid token",
+        "authentication",
+        "authorization",
+        "permission denied",
+        "not found",
+    ]
+    return any(marker in message for marker in permanent_markers)
+
+
+def retry_delay_seconds(attempt_number: int) -> int:
+    base = download_retry_base_delay_seconds()
+    return min(base * (2 ** max(0, attempt_number - 1)), 60)
+
+
+def describe_partial_download_state(path: Path) -> str:
+    if not path.exists():
+        return "no partial download exists yet"
+    try:
+        entries = list(path.iterdir()) if path.is_dir() else []
+        return f"partial path exists with {len(entries)} item(s): {path}"
+    except OSError:
+        return f"partial path exists: {path}"
+
+
+def merge_tree(src: Path, dst: Path) -> None:
+    dst.mkdir(parents=True, exist_ok=True)
+    for child in src.iterdir():
+        target = dst / child.name
+        if child.is_dir():
+            merge_tree(child, target)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                target.unlink()
+            shutil.move(str(child), str(target))
+    try:
+        src.rmdir()
+    except OSError:
+        pass
+
+
+def promote_staged_download(staged: Path, final: Path) -> Path | None:
+    if not staged.exists():
+        print(f"Staged download no longer exists; not installing: {staged}")
+        return None
+    print(f"Staged download passed review: {staged}")
+    print(f"Final install path: {final}")
+    if final.exists():
+        if not prompt_bool("Final path already exists. Merge staged files into existing final path?", False):
+            print("Keeping staged download in place for manual review.")
+            return staged
+        merge_tree(staged, final)
+    else:
+        final.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(staged), str(final))
+    print(f"Installed to: {final}")
+    return final
 
 def download_hf_with_hfdownloader(
     result: SearchResult,
@@ -2730,14 +3606,30 @@ def download_hf_with_hfdownloader(
         print("hfdownloader skipped for this artifact type; using Python fallback to avoid downloading unselected model files.")
         return None
 
-    default_connections = env_int("MODEL_MANAGER_HFD_CONNECTIONS", DEFAULT_HFDOWNLOADER_CONNECTIONS, minimum=1)
-    default_active = env_int("MODEL_MANAGER_HFD_MAX_ACTIVE", DEFAULT_HFDOWNLOADER_MAX_ACTIVE, minimum=1)
+    default_connections, default_active = recommend_hfdownloader_concurrency(result, artifacts)
+    metrics = selected_download_metrics(result, artifacts)
+    if metrics["total_size"] or metrics["file_count"]:
+        size_label = human_size(metrics["total_size"]) if metrics["total_size"] else "unknown"
+        file_label = str(metrics["file_count"] or "?")
+        print(
+            "Auto-tuned hfdownloader defaults from selected download: "
+            f"size={size_label}, files={file_label}, "
+            f"connections={default_connections}, max_active={default_active}"
+        )
     connections = prompt_int_range("How many hfdownloader connections per file?", default_connections, 1, 64)
     max_active = prompt_int_range("How many concurrent file downloads?", default_active, 1, 64)
 
-    base = download_root / "huggingface" / result.kind
-    target = base / result.repo_id
+    target = staging_download_path(result, download_root)
+    base = target.parent
     base.mkdir(parents=True, exist_ok=True)
+    nested = base / result.repo_id
+    safe_nested = base / safe_folder_name(result.repo_id)
+    if nested.exists():
+        print(f"Resuming existing hfdownloader partial download: {nested}")
+    elif safe_nested.exists():
+        print(f"Resuming existing hfdownloader partial download: {safe_nested}")
+    elif target.exists():
+        print(f"Existing staged partial download detected: {describe_partial_download_state(target)}")
 
     cmd = [
         str(binary),
@@ -2785,7 +3677,42 @@ def download_hf_with_hfdownloader(
     if excludes:
         print("Safety excludes for unselected model formats: " + ", ".join(excludes))
     print(f"Running: {quote_cmd(cmd)}")
-    subprocess.run(cmd, check=True, env=env)
+    attempts = download_retry_attempts()
+    for attempt in range(1, attempts + 1):
+        try:
+            if attempt > 1:
+                print(f"Retry attempt {attempt}/{attempts} with hfdownloader. Reusing any partial files already on disk.")
+            subprocess.run(cmd, check=True, env=env)
+            break
+        except subprocess.CalledProcessError as e:
+            debug_log(
+                "hfdownloader-failed",
+                repo_id=result.repo_id,
+                source=result.source,
+                kind=result.kind,
+                cmd=cmd,
+                returncode=e.returncode,
+                attempt=attempt,
+                attempts=attempts,
+            )
+            if attempt >= attempts:
+                partial_hint = nested if nested.exists() else safe_nested if safe_nested.exists() else target if target.exists() else None
+                if partial_hint is not None:
+                    print(f"Partial download remains on disk at {partial_hint}. The next retry or rerun can resume from there.")
+                print(f"hfdownloader failed after {attempts} attempt(s) with rc={e.returncode}. Falling back to huggingface_hub snapshot_download.")
+                return None
+            delay = retry_delay_seconds(attempt)
+            print(
+                f"hfdownloader attempt {attempt}/{attempts} failed with rc={e.returncode}. "
+                f"Retrying in {delay}s and resuming from any partial files already downloaded."
+            )
+            time.sleep(delay)
+    if nested.exists():
+        return nested
+    if safe_nested.exists():
+        return safe_nested
+    if target.exists():
+        return target
     return target
 
 
@@ -2801,11 +3728,27 @@ def download_hf_result(
             return target
         print("Falling back to huggingface_hub snapshot_download.")
 
-    default_workers = env_int("MODEL_MANAGER_HF_MAX_WORKERS", DEFAULT_HF_DOWNLOAD_MAX_WORKERS, minimum=1)
+    transfer_mode = os.getenv("MODEL_MANAGER_HF_TRANSFER_MODE", "fast").strip().lower()
+    safe_mode = transfer_mode in {"safe", "low-memory", "low_memory", "conservative"}
+    default_workers = recommend_hf_worker_count(result, artifacts, safe_mode=safe_mode)
+    default_range_gets = recommend_hf_xet_range_gets(default_workers, safe_mode=safe_mode)
+    metrics = selected_download_metrics(result, artifacts)
+    if metrics["total_size"] or metrics["file_count"]:
+        size_label = human_size(metrics["total_size"]) if metrics["total_size"] else "unknown"
+        file_label = str(metrics["file_count"] or "?")
+        print(
+            "Auto-tuned Hugging Face defaults from selected download: "
+            f"size={size_label}, files={file_label}, "
+            f"workers={default_workers}, xet_range_gets={default_range_gets}"
+        )
     worker_count = prompt_int_range("How many Hugging Face download workers?", default_workers, 1, 64)
-    transfer_cfg = configure_hf_download_environment(worker_count=worker_count)
+    range_gets = recommend_hf_xet_range_gets(worker_count, safe_mode=safe_mode)
+    transfer_cfg = configure_hf_download_environment(worker_count=worker_count, range_gets=range_gets)
     from huggingface_hub import snapshot_download
-    target = download_root / "huggingface" / result.kind / safe_folder_name(result.repo_id)
+    target = staging_download_path(result, download_root)
+    if target.exists():
+        print(f"Resuming existing staged partial download: {describe_partial_download_state(target)}")
+    target.mkdir(parents=True, exist_ok=True)
     token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACEHUB_API_TOKEN")
     ignore = HF_DATASET_IGNORE_MODEL_WEIGHTS if result.kind == "dataset" else None
     print(f"Downloading HF {result.kind}: {result.repo_id}")
@@ -2824,20 +3767,51 @@ def download_hf_result(
             print(f"  {p}")
         if len(allow_patterns) > 40:
             print(f"  ... {len(allow_patterns) - 40} more")
-    snapshot_download(
-        repo_id=result.repo_id,
-        repo_type=result.kind,
-        local_dir=str(target),
-        token=token,
-        allow_patterns=allow_patterns,
-        ignore_patterns=ignore if allow_patterns is None else None,
-        max_workers=int(transfer_cfg["max_workers"]),
-    )
+    attempts = download_retry_attempts()
+    for attempt in range(1, attempts + 1):
+        try:
+            if attempt > 1:
+                print(f"Retry attempt {attempt}/{attempts}. Reusing the staged partial download at {target}.")
+            HF_STUB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            snapshot_download(
+                repo_id=result.repo_id,
+                repo_type=result.kind,
+                local_dir=str(target),
+                cache_dir=str(HF_STUB_CACHE_DIR),
+                token=token,
+                allow_patterns=allow_patterns,
+                ignore_patterns=ignore if allow_patterns is None else None,
+                max_workers=int(transfer_cfg["max_workers"]),
+            )
+            break
+        except Exception as e:
+            debug_log(
+                "snapshot-download-failed",
+                repo_id=result.repo_id,
+                source=result.source,
+                kind=result.kind,
+                target=str(target),
+                attempt=attempt,
+                attempts=attempts,
+                exc_type=type(e).__name__,
+                exc_message=str(e),
+            )
+            permanent = looks_like_permanent_download_error(e)
+            if attempt >= attempts or permanent:
+                if not permanent and target.exists():
+                    print(f"Partial download remains on disk at {target}. The next retry or rerun can resume from there.")
+                raise
+            delay = retry_delay_seconds(attempt)
+            print(
+                f"snapshot_download attempt {attempt}/{attempts} failed: {type(e).__name__}: {e}"
+            )
+            print(f"Retrying in {delay}s and resuming from the partial download at {target}.")
+            time.sleep(delay)
     return target
 
 
 def download_kaggle_result(result: SearchResult, download_root: Path, allow_patterns: list[str] | None) -> Path | None:
-    target = download_root / "kaggle" / result.kind / safe_folder_name(result.repo_id)
+    target = staging_download_path(result, download_root)
     target.mkdir(parents=True, exist_ok=True)
     print(f"Downloading Kaggle {result.kind}: {result.repo_id}")
     print(f"Target: {target}")
@@ -2891,7 +3865,10 @@ BUILTIN_SECURITY_RESEARCH_TERMS = {
 
 
 def normalize_match_text(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", str(value).lower()).strip()
+    text = str(value).lower()
+    text = re.sub(r"([a-z])(\d)", r"\1 \2", text)
+    text = re.sub(r"(\d)([a-z])", r"\1 \2", text)
+    return re.sub(r"[^a-z0-9]+", " ", text).strip()
 
 
 def candidate_risk_files() -> list[Path]:
@@ -2986,6 +3963,166 @@ def load_risk_intel_rows() -> list[dict[str, Any]]:
     return all_rows
 
 
+def load_risk_intel_rows_quiet() -> list[dict[str, Any]]:
+    all_rows: list[dict[str, Any]] = []
+    xlsx_available = importlib.util.find_spec("openpyxl") is not None
+    for path in candidate_risk_files():
+        suffix = path.suffix.lower()
+        if suffix == ".json":
+            rows = load_json_rows(path)
+        elif suffix in {".csv", ".tsv"}:
+            rows = load_csv_rows(path)
+        elif suffix == ".xlsx":
+            if not xlsx_available:
+                continue
+            rows = load_xlsx_rows(path)
+        else:
+            rows = []
+        for row in rows:
+            row["_source_file"] = str(path)
+        all_rows.extend(rows)
+    return all_rows
+
+
+# Cached weekly check for MIT AI Risk Repository updates. We watch the Google
+# Sheets doc ID linked from the "Explore database" button on airisk.mit.edu —
+# MIT swaps that ID when they version up the database, so a change is a strong
+# signal that a newer release exists. All errors (network, parse, cache write)
+# are swallowed silently — never blocks startup.
+_AIRISK_URL = "https://airisk.mit.edu/"
+_AIRISK_CACHE_PATH = CACHE_DIR / "airisk_mit_check.json"
+_AIRISK_CHECK_INTERVAL_S = 7 * 24 * 3600
+_AIRISK_EXPLORE_DB_RE = re.compile(
+    r'<a\b[^>]*href="(https?://docs\.google\.com/spreadsheets/[^"]+)"[^>]*>'
+    r'(?:\s|<[^>]+>)*Explore\s+database',
+    re.IGNORECASE | re.DOTALL,
+)
+_AIRISK_DOC_ID_RE = re.compile(r"/d/([A-Za-z0-9_-]{20,})")
+
+
+def check_airisk_mit_update_quietly() -> None:
+    try:
+        cache: dict[str, Any] = {}
+        if _AIRISK_CACHE_PATH.exists():
+            try:
+                cache = json.loads(_AIRISK_CACHE_PATH.read_text())
+            except (OSError, json.JSONDecodeError):
+                cache = {}
+
+        last_check = float(cache.get("last_check_epoch", 0))
+        cached_doc_id = cache.get("explore_database_doc_id", "")
+        now = time.time()
+
+        if now - last_check < _AIRISK_CHECK_INTERVAL_S:
+            return
+
+        import urllib.request
+        try:
+            req = urllib.request.Request(
+                _AIRISK_URL,
+                headers={"User-Agent": "model_manager.py airisk-version-check"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                html = resp.read(500_000).decode("utf-8", errors="replace")
+        except Exception:
+            return
+
+        link_match = _AIRISK_EXPLORE_DB_RE.search(html)
+        if not link_match:
+            return
+        href = link_match.group(1)
+        id_match = _AIRISK_DOC_ID_RE.search(href)
+        if not id_match:
+            return
+        new_doc_id = id_match.group(1)
+
+        cache["last_check_epoch"] = now
+        cache["explore_database_url"] = href
+        cache["explore_database_doc_id"] = new_doc_id
+        try:
+            _AIRISK_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _AIRISK_CACHE_PATH.write_text(json.dumps(cache, indent=2))
+        except OSError:
+            pass
+
+        if cached_doc_id and cached_doc_id != new_doc_id:
+            print(
+                "NOTE: airisk.mit.edu 'Explore database' link changed — MIT may "
+                "have released a newer AI Risk Repository."
+            )
+            print(f"  previous doc id: {cached_doc_id}")
+            print(f"  current  doc id: {new_doc_id}")
+            print(f"  Visit {_AIRISK_URL} to download and replace your local copy.")
+    except Exception:
+        return
+
+
+def reputation_row_owners(row: dict[str, Any]) -> set[str]:
+    lowered = {str(k).lower().strip(): v for k, v in row.items()}
+    owners: set[str] = set()
+
+    for key in ("owner", "publisher", "author", "creator", "organization", "org"):
+        value = lowered.get(key)
+        if value in {None, ""}:
+            continue
+        for part in re.split(r"[,\n;|]+", str(value)):
+            owner = normalize_owner_name(part)
+            if owner:
+                owners.add(owner)
+
+    for key in ("repo", "repo_id", "model", "model_id", "artifact", "url"):
+        value = lowered.get(key)
+        if value in {None, ""}:
+            continue
+        text = str(value).strip()
+        if not text:
+            continue
+        parsed_repo = parse_hf_repo_id(text)
+        if parsed_repo:
+            owners.add(owner_of(parsed_repo))
+            continue
+        for token in re.split(r"[\s,;|]+", text):
+            token = token.strip().strip("\"'")
+            if "/" in token and not token.lower().startswith("http"):
+                owner = normalize_owner_name(token)
+                if owner:
+                    owners.add(owner)
+    return owners
+
+
+def load_owner_reputation_sets() -> dict[str, set[str]]:
+    global _OWNER_REPUTATION_CACHE
+    if _OWNER_REPUTATION_CACHE is not None:
+        return {key: set(value) for key, value in _OWNER_REPUTATION_CACHE.items()}
+
+    cfg = load_reputation_config()
+    good = {normalize_owner_name(x) for x in cfg.get("known_good_owners", [])}
+    bad = {normalize_owner_name(x) for x in cfg.get("known_malicious_owners", [])}
+    warn = {normalize_owner_name(x) for x in cfg.get("warn_owners", [])}
+    good.discard("")
+    bad.discard("")
+    warn.discard("")
+
+    for row in load_risk_intel_rows_quiet():
+        owners = reputation_row_owners(row)
+        if not owners:
+            continue
+        severity = risk_row_severity(row)
+        if severity in {"DANGER", "BLOCKER"}:
+            bad.update(owners)
+        elif severity == "WARN":
+            warn.update(owners)
+
+    good -= bad
+    warn -= bad
+    _OWNER_REPUTATION_CACHE = {
+        "known_good_owners": set(good),
+        "known_malicious_owners": set(bad),
+        "warn_owners": set(warn),
+    }
+    return {key: set(value) for key, value in _OWNER_REPUTATION_CACHE.items()}
+
+
 def risk_row_terms(row: dict[str, Any]) -> list[str]:
     preferred = [
         "repo", "repo_id", "model", "model_id", "name", "artifact", "owner", "publisher",
@@ -3078,10 +4215,10 @@ def predownload_risk_and_completeness_check(
     search_blob = normalize_match_text(" ".join([result.repo_id, result.title or ""] + selected_names + all_names[:50]))
     owner = owner_of(result.repo_id)
 
-    cfg = load_reputation_config()
-    bad_owners = {str(x).lower() for x in cfg.get("known_malicious_owners", [])}
-    warn_owners = {str(x).lower() for x in cfg.get("warn_owners", [])}
-    known_good = {str(x).lower() for x in cfg.get("known_good_owners", [])}
+    reputation = load_owner_reputation_sets()
+    bad_owners = reputation["known_malicious_owners"]
+    warn_owners = reputation["warn_owners"]
+    known_good = reputation["known_good_owners"]
 
     if owner in bad_owners:
         findings.append({"severity": "DANGER", "message": f"owner is in local known_malicious_owners: {owner}"})
@@ -3154,7 +4291,7 @@ def predownload_risk_and_completeness_check(
         return prompt_bool("Proceed with download despite WARN/INFO findings?", True)
     return True
 
-def post_download_audit(result: SearchResult, target: Path, allow_patterns: list[str] | None) -> None:
+def post_download_audit(result: SearchResult, target: Path, allow_patterns: list[str] | None) -> bool:
     findings = verify_download_integrity(target, result.files, allow_patterns)
     print_findings(findings)
     scanner_findings = run_external_security_tools(target)
@@ -3164,12 +4301,22 @@ def post_download_audit(result: SearchResult, target: Path, allow_patterns: list
     offer_delete, reason = should_offer_delete(all_findings)
     if offer_delete:
         delete_path_after_confirmation(target, reason)
-    elif all_findings:
-        print("No DANGER/BLOCKER findings requiring delete offer; keeping files.")
+        if not target.exists():
+            return False
+        print("Serious finding remains in staged download. Keeping it staged unless you explicitly continue.")
+        return prompt_bool("Install staged download anyway?", False)
+    if all_findings:
+        print("No DANGER/BLOCKER findings requiring delete offer; staged files can be installed after review.")
+        return prompt_bool("Install staged download despite WARN/INFO/HIGH findings?", True)
+    return True
 
 
 def download_selected(results: list[SearchResult], download_root_override: Path | None = None) -> None:
     if not results:
+        return
+    results = review_download_queue(results)
+    if not results:
+        print("No selections remain. Nothing to download.")
         return
     if download_root_override is not None:
         download_root = download_root_override.expanduser().resolve()
@@ -3194,6 +4341,8 @@ def download_selected(results: list[SearchResult], download_root_override: Path 
             for art in artifacts:
                 print(f"  - {art.label} ({human_size(art.total_size)})")
             mode = "artifact_numbers"
+        elif r.source == "hf" and r.kind == "model" and r.whole_repo_selected:
+            mode, patterns, artifacts = "whole_repo", None, []
         elif r.source == "hf" and r.kind == "model":
             mode, patterns, artifacts = choose_artifacts(r)
         else:
@@ -3211,12 +4360,26 @@ def download_selected(results: list[SearchResult], download_root_override: Path 
             elif r.source == "kaggle":
                 target = download_kaggle_result(r, download_root, patterns)
         except Exception as e:
+            debug_log(
+                "download-failed",
+                repo_id=r.repo_id,
+                source=r.source,
+                kind=r.kind,
+                exc_type=type(e).__name__,
+                exc_message=str(e),
+                traceback=traceback.format_exc(),
+            )
             print(f"Download failed: {type(e).__name__}: {e}")
             continue
         if target:
-            post_download_audit(r, target, patterns)
-            if r.kind == "model":
-                offer_prepare_models(target, download_root)
+            ok_to_install = post_download_audit(r, target, patterns)
+            if not ok_to_install:
+                print(f"Not installing staged download. Staged path: {target if target.exists() else 'deleted'}")
+                continue
+            final_target = final_download_path(r, download_root)
+            installed = promote_staged_download(target, final_target)
+            if installed and r.kind == "model":
+                offer_prepare_models(installed, download_root)
 
 # -----------------------------------------------------------------------------
 # Dataset sampling
@@ -3541,6 +4704,7 @@ def filter_and_rank_search_results(
     kind: str,
     selected_artifact_types: set[str],
     model_size_range: tuple[int | None, int | None],
+    exclude_multipart_models: bool,
     excluded_publishers: set[str],
     excluded_terms: set[str],
     excluded_family_terms: list[str],
@@ -3553,6 +4717,7 @@ def filter_and_rank_search_results(
     if kind in {"models", "both"}:
         results = filter_results_by_artifact_types(results, selected_artifact_types)
         results = filter_results_by_model_size(results, model_size_range)
+        results = filter_results_by_multipart_models(results, exclude_multipart_models)
     annotate_results_with_leaderboard_cache(results)
     annotate_recommendations(results)
     results = apply_model_family_exclusions(results, excluded_family_terms, quiet_no_match=quiet_family_no_match)
@@ -3562,7 +4727,7 @@ def filter_and_rank_search_results(
         after = len(results)
         if after < before:
             print(f"Hidden {before - after} likely duplicate/mirror repo(s). Kept strongest candidate per exact variant family.")
-    results.sort(key=lambda r: (r.leaderboard_rank is None, r.leaderboard_rank or 10**9, r.recommendation not in {"KnownGood", "Leaderboard"}, -(r.downloads or 0), -(r.size_bytes or 0)))
+    results.sort(key=lambda r: (r.leaderboard_rank is None, r.leaderboard_rank or 10**9, r.recommendation not in {"KnownGood", "KnownGood/DF", "Leaderboard"}, -(r.downloads or 0), -(r.size_bytes or 0)))
     assign_indexes(results)
     return results
 
@@ -3572,9 +4737,17 @@ def deep_hf_candidate_limit(limit: int) -> int:
 
 
 def run_search_flow(options: argparse.Namespace | None = None) -> None:
+    check_airisk_mit_update_quietly()
     download_root_override = None
     if options is not None and getattr(options, "download_root", None):
         download_root_override = Path(options.download_root).expanduser().resolve()
+    debug_log(
+        "run-search-flow-start",
+        options_supplied=options is not None,
+        download_root_override=str(download_root_override) if download_root_override else None,
+        specific_repo=getattr(options, "specific_repo", None) if options is not None else None,
+        search_query=getattr(options, "search_query", None) if options is not None else None,
+    )
 
     specific_repo_arg = getattr(options, "specific_repo", None) if options is not None else None
     if specific_repo_arg or (options is None and prompt_bool("Do you have a single specific model or dataset to download?", False)):
@@ -3621,11 +4794,17 @@ def run_search_flow(options: argparse.Namespace | None = None) -> None:
             kind = prompt_choice("Search for", ["models", "datasets", "both"], "models")
         selected_artifact_types: set[str] = set()
         model_size_range: tuple[int | None, int | None] = (None, None)
+        exclude_multipart_models = False
         if kind in {"models", "both"}:
             selected_from_args = parse_artifact_type_filter_value(getattr(options, "artifact_types", None)) if options is not None else None
             selected_artifact_types = selected_from_args if selected_from_args is not None else choose_artifact_type_filters()
             size_from_args = parse_model_size_range_or_default(getattr(options, "model_size_range", None)) if options is not None else None
             model_size_range = size_from_args if size_from_args is not None else prompt_model_size_range()
+            exclude_multipart_arg = getattr(options, "exclude_multipart_models", None) if options is not None else None
+            if exclude_multipart_arg is not None:
+                exclude_multipart_models = bool(exclude_multipart_arg)
+            elif multipart_artifact_filter_relevant(selected_artifact_types):
+                exclude_multipart_models = prompt_exclude_multipart_models(selected_artifact_types)
         if options is not None and getattr(options, "exclude_publishers", None) is not None:
             excluded_publishers = parse_excluded_publishers_value(options.exclude_publishers)
         else:
@@ -3645,35 +4824,82 @@ def run_search_flow(options: argparse.Namespace | None = None) -> None:
         if page_size is None:
             page_size = prompt_int("Display batch size", 20)
         page_size = max(1, int(page_size))
-        hide_duplicate_families_pref = False
+        hide_duplicate_families_pref: bool | None = False
         excluded_family_terms: list[str] = []
         if kind in {"models", "both"}:
             hide_arg = getattr(options, "hide_duplicate_families", None) if options is not None else None
-            hide_duplicate_families_pref = hide_arg if hide_arg is not None else prompt_bool("Hide likely duplicate/mirror repos by exact variant family?", True)
+            hide_duplicate_families_pref = hide_arg if hide_arg is not None else None
             if options is not None and getattr(options, "exclude_families", None) is not None:
                 excluded_family_terms = parse_model_family_exclusion_terms(options.exclude_families)
             else:
                 excluded_family_terms = prompt_model_family_exclusion_terms()
 
-        provider_search_terms = expand_search_terms_for_artifacts(search_terms, selected_artifact_types) if kind in {"models", "both"} else search_terms
+        provider_search_terms = search_terms
+        if kind in {"models", "both"}:
+            provider_search_terms = expand_search_terms_for_model_name_variants(provider_search_terms)
+            provider_search_terms = expand_search_terms_for_artifacts(provider_search_terms, selected_artifact_types)
+        pre_cap_count = len(provider_search_terms)
+        if pre_cap_count > _HF_SEARCH_MAX_TERMS:
+            provider_search_terms = provider_search_terms[:_HF_SEARCH_MAX_TERMS]
+            print(
+                f"Capping expanded search terms from {pre_cap_count} to {_HF_SEARCH_MAX_TERMS} "
+                f"(MODEL_MANAGER_HF_SEARCH_MAX_TERMS to override)."
+            )
         if provider_search_terms != search_terms:
-            print("Expanded search with artifact filename terms:")
+            print("Expanded search with model naming variants and artifact filename terms:")
             for term in provider_search_terms[:20]:
                 print(f"  - {term}")
             if len(provider_search_terms) > 20:
                 print(f"  ... {len(provider_search_terms) - 20} more")
+        debug_log(
+            "search-config",
+            search_terms=search_terms,
+            provider_search_terms=provider_search_terms[:20],
+            provider_search_term_count=len(provider_search_terms),
+            kind=kind,
+            source=source,
+            limit=limit,
+            page_size=page_size,
+            selected_artifact_types=sorted(selected_artifact_types),
+            model_size_range=size_range_label(model_size_range),
+            exclude_multipart_models=exclude_multipart_models,
+            excluded_publishers=sorted(excluded_publishers),
+            excluded_terms=sorted(excluded_terms),
+            excluded_family_terms=excluded_family_terms,
+            hide_duplicate_families=hide_duplicate_families_pref if hide_duplicate_families_pref is not None else "prompt_after_search",
+        )
 
         raw_results = collect_search_results(provider_search_terms, source, kind, limit)
+        raw_hit_count = len(raw_results)
+        merged_hit_count = len(merge_search_results(raw_results))
+        if kind in {"models", "both"} and hide_duplicate_families_pref is None:
+            hide_duplicate_families_pref = prompt_hide_duplicate_families_preference(raw_results)
         results = filter_and_rank_search_results(
             raw_results,
             kind,
             selected_artifact_types,
             model_size_range,
+            exclude_multipart_models,
             excluded_publishers,
             excluded_terms,
             excluded_family_terms,
-            hide_duplicate_families_pref,
+            bool(hide_duplicate_families_pref),
         )
+        debug_log(
+            "search-results",
+            raw_hit_count=raw_hit_count,
+            merged_hit_count=merged_hit_count,
+            displayed_count=len(results),
+            displayed_indexes=[r.index for r in results[:20]],
+            displayed_repo_ids=[r.repo_id for r in results[:20]],
+        )
+        if raw_hit_count or merged_hit_count or results:
+            summary_parts = [f"Showing {len(results)} result(s)"]
+            if merged_hit_count != len(results):
+                summary_parts.append(f"from {merged_hit_count} merged repo hit(s)")
+            if raw_hit_count != merged_hit_count:
+                summary_parts.append(f"from {raw_hit_count} raw hit(s)")
+            print("Search summary: " + "; ".join(summary_parts) + ".")
 
         if source in {"huggingface", "both"} and kind in {"models", "both"} and len(results) < page_size:
             deep_limit = deep_hf_candidate_limit(limit)
@@ -3694,17 +4920,35 @@ def run_search_flow(options: argparse.Namespace | None = None) -> None:
                     pre_excluded_terms=excluded_terms,
                     pre_excluded_family_terms=excluded_family_terms,
                 )
+                raw_hit_count = len(raw_results)
+                merged_hit_count = len(merge_search_results(raw_results))
                 results = filter_and_rank_search_results(
                     raw_results,
                     "models",
                     selected_artifact_types,
                     model_size_range,
+                    exclude_multipart_models,
                     excluded_publishers,
                     excluded_terms,
                     excluded_family_terms,
-                    hide_duplicate_families_pref,
+                    bool(hide_duplicate_families_pref),
                     quiet_family_no_match=True,
                 )
+                debug_log(
+                    "search-results-deep-scan",
+                    raw_hit_count=raw_hit_count,
+                    merged_hit_count=merged_hit_count,
+                    displayed_count=len(results),
+                    displayed_indexes=[r.index for r in results[:20]],
+                    displayed_repo_ids=[r.repo_id for r in results[:20]],
+                )
+                if raw_hit_count or merged_hit_count or results:
+                    summary_parts = [f"Showing {len(results)} result(s) after deep scan"]
+                    if merged_hit_count != len(results):
+                        summary_parts.append(f"from {merged_hit_count} merged repo hit(s)")
+                    if raw_hit_count != merged_hit_count:
+                        summary_parts.append(f"from {raw_hit_count} raw hit(s)")
+                    print("Search summary: " + "; ".join(summary_parts) + ".")
         if not results:
             print("No results.")
             print("Try a broader term, a different artifact type, or another source.")
@@ -3725,8 +4969,10 @@ def run_search_flow(options: argparse.Namespace | None = None) -> None:
 
 def run_local_audit_only(dry_run: bool | None = None) -> None:
     script_candidates = [
-        Path("/Volumes/ModelStorage/models-flat/model_audit.py"),
+        MODEL_MANAGER_SCRIPT_DIR / "model_audit.py",
+        Path("<Your Model Directory>/model_audit.py"),
         Path("./model_audit.py"),
+        Path.home() / "model_tools" / "model_audit.py",
         Path.home() / "model_audit.py",
     ]
     script = next((p for p in script_candidates if p.is_file()), None)
@@ -3764,7 +5010,19 @@ def main() -> int:
     configure_hf_download_environment()
     print(f"Model Manager {MODEL_MANAGER_VERSION}")
     print(f"Active script: {Path(__file__).expanduser().resolve()}")
-    ap = argparse.ArgumentParser(description="Interactive HF/Kaggle model+dataset search/download manager")
+    print(f"Sibling tool directory (checked first for prep/audit/scanners): {MODEL_MANAGER_SCRIPT_DIR}")
+    ap = argparse.ArgumentParser(
+        description="Interactive HF/Kaggle model+dataset search/download manager; optional subprocess helpers for prep, conversion, audit, and scanners.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Optional subprocess integrations (only when you choose them or use --audit/--gui):\n"
+        "  Prep:        Prepare_models_for_All.py (MODEL_MANAGER_SCRIPT_DIR, then MODEL_TOOLS_DIR, …)\n"
+        "  Conversion:  model_conversion.py (same search order)\n"
+        "  Local audit: model_audit.py (--audit; same search order)\n"
+        "  Scanners:    modelaudit, modelscan, ModelGuard, skillcheck, … under script dir then MODEL_TOOLS_DIR\n"
+        "  Downloads:   hfdownloader if MODEL_MANAGER_HFDOWNLOADER is enabled; else huggingface_hub\n"
+        "  GUI:         model_manager_gui.swift next to this script (requires swift)\n"
+        "MODEL_MANAGER_TOOLS_DIR defaults to <REDACTED_PATH>; sibling directory is always this script's folder.",
+    )
     ap.add_argument("--search", action="store_true", help="Start search flow immediately")
     ap.add_argument("--audit", action="store_true", help="Run local audit flow immediately")
     ap.add_argument("--leaderboards", action="store_true", help="Show leaderboard sources/search immediately")
@@ -3776,6 +5034,8 @@ def main() -> int:
     ap.add_argument("--search-kind", choices=["models", "datasets", "both"], help="Search for models, datasets, or both")
     ap.add_argument("--artifact-types", help="Model artifact types to include, e.g. gguf,coreml or any")
     ap.add_argument("--model-size-range", help='Model artifact size range, e.g. "200 MB - 2 TB" or any')
+    ap.add_argument("--exclude-multipart-models", dest="exclude_multipart_models", action="store_true", default=None, help="Hide multi-part model artifacts such as gguf-split or safetensors-sharded")
+    ap.add_argument("--include-multipart-models", dest="exclude_multipart_models", action="store_false", help="Allow multi-part model artifacts such as gguf-split or safetensors-sharded")
     ap.add_argument("--exclude-publishers", help="Comma-separated authors/publishers to exclude, or none")
     ap.add_argument("--exclude-terms", help="Comma-separated terms/tags to exclude, or none")
     ap.add_argument("--exclude-families", help="Comma-separated model families to exclude, or none")
@@ -3791,50 +5051,64 @@ def main() -> int:
     ap.add_argument("--manual-leaderboard-cache", action="store_true", help="Prompt to manually add/update cached leaderboard model IDs")
     ap.add_argument("--refresh-leaderboard-cache", action="store_true", help="Refresh best-effort cached leaderboard model IDs")
     ap.add_argument("--leaderboard-cache-limit", type=int, help="Cache refresh limit per category")
+    ap.add_argument("--debug", action="store_true", help="Print picker/search debug traces to stderr")
+    ap.add_argument("--debug-log", help="Optional file path for debug traces when --debug is enabled")
     args = ap.parse_args()
+    configure_debug_mode(args.debug or DEBUG_ENABLED, args.debug_log or (str(DEBUG_LOG_PATH) if DEBUG_LOG_PATH else None))
+    debug_log("main-args", args=vars(args))
+    if DEBUG_ENABLED:
+        print("Debug mode enabled.")
+        if DEBUG_LOG_PATH is not None:
+            print(f"Debug log: {DEBUG_LOG_PATH}")
 
-    if args.search:
-        run_search_flow(args)
-        return 0
-    if args.audit:
-        run_local_audit_only(args.audit_dry_run)
-        return 0
-    if args.leaderboards:
-        categories = None
-        if args.leaderboard_categories:
-            categories = [normalize_match_text(x) for x in re.split(r"[,;]+", args.leaderboard_categories) if normalize_match_text(x)]
-        leaderboard_options_supplied = any([
-            args.leaderboard_categories,
-            args.skip_hf_spaces,
-            args.manual_leaderboard_cache,
-            args.refresh_leaderboard_cache,
-            args.leaderboard_cache_limit is not None,
-        ])
-        show_leaderboard_sources(
-            categories_override=categories,
-            search_hf_spaces=(not args.skip_hf_spaces) if leaderboard_options_supplied else None,
-            manual_cache_update=args.manual_leaderboard_cache if leaderboard_options_supplied else None,
-            refresh_cache=args.refresh_leaderboard_cache if leaderboard_options_supplied else None,
-            refresh_limit=args.leaderboard_cache_limit,
-        )
-        return 0
-    if args.gui:
-        launch_native_gui()
-        return 0
-
-    while True:
-        print()
-        choice = prompt_choice("What do you want to do?", ["search/download", "local audit", "leaderboards", "native GUI", "quit"], "search/download")
-        if choice == "search/download":
-            run_search_flow()
-        elif choice == "local audit":
-            run_local_audit_only()
-        elif choice == "leaderboards":
-            show_leaderboard_sources()
-        elif choice == "native GUI":
-            launch_native_gui()
-        else:
+    try:
+        if args.search:
+            run_search_flow(args)
             return 0
+        if args.audit:
+            run_local_audit_only(args.audit_dry_run)
+            return 0
+        if args.leaderboards:
+            categories = None
+            if args.leaderboard_categories:
+                categories = [normalize_match_text(x) for x in re.split(r"[,;]+", args.leaderboard_categories) if normalize_match_text(x)]
+            leaderboard_options_supplied = any([
+                args.leaderboard_categories,
+                args.skip_hf_spaces,
+                args.manual_leaderboard_cache,
+                args.refresh_leaderboard_cache,
+                args.leaderboard_cache_limit is not None,
+            ])
+            show_leaderboard_sources(
+                categories_override=categories,
+                search_hf_spaces=(not args.skip_hf_spaces) if leaderboard_options_supplied else None,
+                manual_cache_update=args.manual_leaderboard_cache if leaderboard_options_supplied else None,
+                refresh_cache=args.refresh_leaderboard_cache if leaderboard_options_supplied else None,
+                refresh_limit=args.leaderboard_cache_limit,
+            )
+            return 0
+        if args.gui:
+            launch_native_gui()
+            return 0
+
+        while True:
+            print()
+            choice = prompt_choice("What do you want to do?", ["search/download", "local audit", "leaderboards", "native GUI", "quit"], "search/download")
+            if choice == "search/download":
+                run_search_flow()
+            elif choice == "local audit":
+                run_local_audit_only()
+            elif choice == "leaderboards":
+                show_leaderboard_sources()
+            elif choice == "native GUI":
+                launch_native_gui()
+            else:
+                return 0
+    except InputAborted:
+        print()
+        print("Interactive input was closed. Exiting without making changes.")
+        print("Re-run `model_manager.py` in a terminal session to continue prompts like result selection or delete confirmation.")
+        return 1
 
 
 if __name__ == "__main__":

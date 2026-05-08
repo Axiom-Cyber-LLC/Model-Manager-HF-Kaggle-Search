@@ -8,6 +8,22 @@ The active script is `model_manager.py`. It downloads models to disk first, then
 
 This public repository was rebuilt from a sanitized export. Do not commit local model caches, scan results, chat exports, binary model files, scanner checkouts, virtual environments, archives, spreadsheets, or machine-specific paths.
 
+## Recent changes
+
+### 2026-05-08
+
+**`Prepare_models_for_Lmstudio.py`**
+- HF cache migration now scans every cache root in `HF_CACHE_DIRS` for `models--owner--repo/` directories and hardlinks the latest snapshot's files into LM Studio's `downloadsFolder` (read from `~/.lmstudio/settings.json`, with a sensible fallback). Migration is default-on now; use `--no-migrate-hf-cache` to skip. The destination is overridable via the new `--lmstudio-dir` flag. Hardlinks are zero-extra-disk on the same volume; source directories are left intact unless `--cleanup-hf-source` is passed.
+- New `--resume-broken` flag: detects HF hub-cache repos that have only a `refs/main` stub (interrupted or never-completed downloads) and resumes them via `huggingface_hub.snapshot_download` — idempotent, honors `HF_TOKEN`, supports parallel repos via `--resume-broken-workers N`. Combine with `--dry-run` to see per-repo size estimates without downloading.
+- New `--clean-orphan-stubs` flag: scans every HF cache root (plus `~/.cache/model_manager/hf_refs_stubs/`) for `models--*` dirs that contain only `refs/` and no `blobs/` or `snapshots/` — bookkeeping residue from `huggingface_hub.snapshot_download(local_dir=...)`. Prints copy-pasteable `rm -rf` commands grouped by parent directory; never deletes anything itself.
+
+**`model_manager.py`**
+- `snapshot_download` is now invoked with `cache_dir=~/.cache/model_manager/hf_refs_stubs/`, steering its always-written `refs/<rev>` stubs into a throwaway location so they no longer pollute the user's main `HF_HUB_CACHE`.
+- HF API throttling and 429 handling: `MODEL_MANAGER_HF_SEARCH_DELAY_MS` (default 150 ms) inserts a small sleep between metadata fetches during search. A new retry helper catches HTTP 429 responses, honors the `Retry-After` header, and retries up to 3 times. Wrapped around `list_models`, `model_info`, `list_datasets`, and `dataset_info`.
+- Search-term expansion is now capped at `MODEL_MANAGER_HF_SEARCH_MAX_TERMS` (default 5). The previous combination of name-variant expansion and artifact-suffix expansion could produce 25+ search terms per query, multiplying API load.
+- `DEFAULT_EXCLUDED_AUTHORS` is now an empty list. The previous list (`DavidAU`, `TheBloke`, `mradermacher`, `bartowski`) contradicted `DEFAULT_KNOWN_GOOD_OWNERS` (which already included `bartowski`) and was not risk-justified. Per-search exclusions can still be entered at the prompt or via the `--exclude-publishers` flag.
+- Weekly cached check for AI Risk Repository updates: at search start, the manager extracts the Google Sheets doc ID from the "Explore database" button on `airisk.mit.edu` and compares it to the cached value. When the ID changes (signal that MIT versioned up the database), a one-line nag prints the previous and current IDs and the URL to re-download. Cache state lives in `~/.cache/model_manager/airisk_mit_check.json`. All network and parse errors are swallowed silently — the check never blocks startup.
+
 ## Core Setup
 
 ```bash
