@@ -2,7 +2,7 @@
 """
 Register the flat-dir models with Ollama (multi-threaded).
 
-For every GGUF in /Volumes/ModelStorage/models-flat/local/{short}/ that is
+For every GGUF in <Your Model Directory>/local/{short}/ that is
 actually a text-generation model (not an image/video diffusion GGUF), this
 script creates a Modelfile and runs `ollama create` under a threaded pool.
 
@@ -10,7 +10,7 @@ Image/video diffusion GGUFs (Flux, SDXL, Z-Image, Pixelwave, Wan, Qwen-
 Image-Edit, etc.) are detected and skipped — they crash llama.cpp's loader
 and throw 500 errors in Ollama.
 
-State is cached at ~/.ollama/models/ai_model_state.json (mtime-based);
+State is cached at <REDACTED_PATH> (mtime-based);
 unchanged blobs won't be re-registered unless --force is passed.
 
 Usage:
@@ -34,31 +34,33 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from prepare_models_env import extend_scan_roots
+
 
 # ── Defaults ──────────────────────────────────────────────────────────
 
 HOME = Path.home()
-FLAT_MODELS = Path("/Volumes/ModelStorage/models-flat/local")
+FLAT_MODELS = Path("<Your Model Directory>/local")
 STATE_FILE = HOME / ".ollama" / "models" / "ai_model_state.json"
 
 # Unified scan roots — scanned recursively (rglob, unlimited depth).
 # Dedup is by resolved physical path so symlinks / overlapping paths don't
 # double-register the same blob. Missing roots are skipped silently.
-SCAN_ROOTS = [
-    Path("/Volumes/ModelStorage/models"),
-    Path("/Volumes/ModelStorage/models-flat"),
-    Path("/Volumes/ModelStorage/models/huggingface/model"),
-    Path("/Volumes/ModelStorage/models-flat/local"),
-    Path("/Volumes/ModelStorage/.cache/huggingface"),
+SCAN_ROOTS = extend_scan_roots([
+    Path("<Your Model Directory>"),
+    Path("<Your Model Directory>"),
+    Path("<Your Model Directory>/huggingface/model"),
+    Path("<Your Model Directory>/local"),
+    Path("<REDACTED_PATH>"),
     Path.home() / ".cache" / "huggingface",   # symlink to the SSDE one
-    Path("/Volumes/ModelStorage/.cache/modelscope"),
-    Path("/Volumes/ModelStorage/.cache/model_manager"),
+    Path("<Your Model Directory>"),
+    Path("<REDACTED_PATH>"),
     Path.home() / "model_downloads" / "huggingface" / "model",
     Path.home() / "Library" / "Application Support" / "nomic.ai" / "GPT4All",
     Path.home() / ".lmstudio" / "models",
-    Path("~/skill-scanner/scan-results/20260503T074319Z"),
-    Path("~/skill-scanner/scan-results/20260503T074334Z"),
-]
+    Path("<REDACTED_PATH>"),
+    Path("<REDACTED_PATH>"),
+])
 
 # Kept for the --clean-orphans path; NOT applied during registration anymore
 # (user instruction: register every GGUF without name-based filtering).
@@ -285,7 +287,7 @@ def detect_ollama_storage_mismatch() -> dict:
     """
     target = os.environ.get("OLLAMA_MODELS")
     if not target:
-        # Daemon default is ~/.ollama/models when env var unset; read daemon env directly
+        # Daemon default is <REDACTED_PATH> when env var unset; read daemon env directly
         try:
             # Find daemon PID and read its environment
             out = subprocess.run(["pgrep", "-f", "ollama serve"],
@@ -311,10 +313,10 @@ def detect_ollama_storage_mismatch() -> dict:
 
     hint = None
     if not blobs_ok:
-        # Look for a real blobs dir nearby (common pattern: /Volumes/X/models/blobs when
-        # daemon points at /Volumes/X/models-flat). Probe common siblings.
+        # Look for a real blobs dir nearby (common pattern: <REDACTED_PATH> when
+        # daemon points at <REDACTED_PATH>). Probe common siblings.
         for candidate in [
-            Path("/Volumes/ModelStorage/models"),
+            Path("<Your Model Directory>"),
             Path.home() / ".ollama" / "models",
         ]:
             if (candidate / "blobs").is_dir() and any((candidate / "blobs").iterdir()):
@@ -382,21 +384,90 @@ def register_one(short: str, gguf: Path, ollama_name: str,
         return "failed", "timeout"
 
 
+def find_missing_blob_orphans(manifests_dir: Path, blobs_dir: Path) -> list[tuple[str, Path, list[str]]]:
+    """
+    Walk Ollama manifests and return (ollama_name, manifest_path, missing_digests)
+    for every entry whose config or layer blobs no longer exist on disk.
+    """
+    out: list[tuple[str, Path, list[str]]] = []
+    base = manifests_dir / "registry.ollama.ai"
+    if not base.is_dir():
+        return out
+
+    for manifest in base.rglob("*"):
+        if not manifest.is_file():
+            continue
+        try:
+            content = json.loads(manifest.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        try:
+            rel = manifest.relative_to(base)
+        except ValueError:
+            continue
+        parts = rel.parts
+        if len(parts) < 3:
+            continue
+        owner = parts[0]
+        repo = "/".join(parts[1:-1])
+        tag = parts[-1]
+        ollama_name = f"{repo}:{tag}" if owner == "library" else f"{owner}/{repo}:{tag}"
+
+        missing: list[str] = []
+        cfg_digest = content.get("config", {}).get("digest", "") or ""
+        if cfg_digest.startswith("sha256:"):
+            if not (blobs_dir / cfg_digest.replace(":", "-")).exists():
+                missing.append(cfg_digest)
+        for layer in content.get("layers", []) or []:
+            digest = layer.get("digest", "") or ""
+            if digest.startswith("sha256:") and not (blobs_dir / digest.replace(":", "-")).exists():
+                missing.append(digest)
+
+        if missing:
+            out.append((ollama_name, manifest, missing))
+    return out
+
+
 def clean_orphans(state: dict, dry_run: bool):
     """
-    Remove Ollama entries whose backing file no longer exists. Also strips
-    image/diffusion entries (legacy from old registrations).
+    Remove Ollama registrations that no longer have working backing.
+
+    Two passes:
+      1. Image/diffusion entries by name pattern (legacy mistakes).
+      2. Entries whose manifest references a config or layer blob that does
+         not exist on disk (the "deleted the GGUF, registration sticks
+         around" case).
     """
     current = ollama_list()
     removed = 0
+
+    # Pass 1: image/diffusion name-pattern removals (preserved from old behavior)
+    image_orphans: set[str] = set()
     for name in current:
         base = name.split(":", 1)[0]
-        # Heuristic: any image/diffusion marker in the name
         if IMAGE_MODEL_PATTERNS.search(base):
-            _log(f"  RM (image)  {name}")
+            image_orphans.add(name)
+            _log(f"  RM (image)   {name}")
             if not dry_run:
                 subprocess.run(["ollama", "rm", name], capture_output=True)
             removed += 1
+
+    # Pass 2: missing-blob orphans (the actual "stale registration" cleanup)
+    pre = detect_ollama_storage_mismatch()
+    if pre.get("ok"):
+        manifests_dir = Path(pre["manifests_dir"])
+        blobs_dir = Path(pre["blobs_dir"])
+        for ollama_name, _manifest, missing in find_missing_blob_orphans(manifests_dir, blobs_dir):
+            if ollama_name in image_orphans:
+                continue
+            sample = ", ".join(d.split(":", 1)[1][:8] + "…" for d in missing[:2])
+            extra = f" +{len(missing) - 2} more" if len(missing) > 2 else ""
+            _log(f"  RM (orphan)  {ollama_name:<50}  missing blob: {sample}{extra}")
+            if not dry_run:
+                subprocess.run(["ollama", "rm", ollama_name], capture_output=True)
+            removed += 1
+
     return removed
 
 

@@ -654,9 +654,12 @@ def configure_hf_download_environment(
 
 
 def hfdownloader_enabled() -> bool:
-    # Keep the newer Go downloader opt-in for now. The legacy
-    # snapshot_download path is simpler and matches the older working scripts.
-    value = os.getenv("MODEL_MANAGER_HFDOWNLOADER", "0").strip().lower()
+    # Default-on: route model downloads through the Go hfdownloader binary
+    # for multipart/chunked-parallel speed. Datasets, artifact selections that
+    # hfdownloader can't preserve cleanly, and any download error all fall
+    # back to huggingface_hub.snapshot_download automatically. To force the
+    # Python path for one run: MODEL_MANAGER_HFDOWNLOADER=0 modelmgr ...
+    value = os.getenv("MODEL_MANAGER_HFDOWNLOADER", "1").strip().lower()
     return value not in {"0", "false", "no", "off", "python"}
 
 
@@ -1707,10 +1710,28 @@ def hf_api():
     return HfApi(token=os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACEHUB_API_TOKEN"))
 
 
-# Throttle between HF API metadata calls during search. Anonymous HF API limit is
-# ~500 req / 300s; a small per-call sleep keeps a 500-candidate scan under that.
-# Authenticated users (HF_TOKEN set) get much higher limits — set to 0 if needed.
-_HF_SEARCH_DELAY_S = env_int("MODEL_MANAGER_HF_SEARCH_DELAY_MS", 150, minimum=0) / 1000.0
+# Throttle between HF API metadata calls during search. Default 0 (off).
+#
+# Throttle is only useful for ANONYMOUS callers (no HF account). With an HF
+# account — free OR Pro — `HF_TOKEN` raises the per-user rate limit far
+# beyond anything this script's parallel search would hit. The 429 retry
+# helper below absorbs the rare ceiling case automatically.
+#
+# Set MODEL_MANAGER_HF_SEARCH_DELAY_MS=150 (or higher) only if you're
+# running anonymous (no HF_TOKEN) AND you start seeing many 429 retries on
+# multi-term searches. How to set it:
+#
+#   One-off (this command only):
+#       MODEL_MANAGER_HF_SEARCH_DELAY_MS=150 modelmgr
+#
+#   Current shell only:
+#       export MODEL_MANAGER_HF_SEARCH_DELAY_MS=150
+#
+#   Persistent (every new shell): add the line above to <REDACTED_PATH>, then
+#       source <REDACTED_PATH>
+#
+# Value is milliseconds between metadata fetches; 0 disables.
+_HF_SEARCH_DELAY_S = env_int("MODEL_MANAGER_HF_SEARCH_DELAY_MS", 0, minimum=0) / 1000.0
 
 # Cap the total number of HF search-term variants expanded per query. The two
 # expanders (name variants × artifact suffixes) can produce 25+ terms per input,
@@ -1816,46 +1837,74 @@ def search_hf_models(
         models = list(_hf_call_with_retry(api.list_models, search=query, limit=fetch_limit, sort="downloads", full=True))
     except TypeError:
         models = list(_hf_call_with_retry(api.list_models, search=query, limit=fetch_limit, full=True))
-    results: list[SearchResult] = []
+
+    # First pass: pre-filter (cheap, no network) so we don't waste model_info on excluded repos.
+    candidates: list[tuple[str, Any]] = []
     for m in models:
         repo_id = getattr(m, "modelId", None) or getattr(m, "id", None)
         if not repo_id:
             continue
         if candidate_excluded_before_metadata(
-            repo_id,
-            m,
+            repo_id, m,
             excluded_publishers=pre_excluded_publishers,
             excluded_terms=pre_excluded_terms,
             excluded_family_terms=pre_excluded_family_terms,
         ):
             continue
-        notes: list[str] = []
+        candidates.append((repo_id, m))
+        # In normal-scan mode, stop after `limit` candidates so we don't fetch
+        # 500 metadatas worth in a small search.
+        if candidate_limit is None and len(candidates) >= limit:
+            break
+
+    # Second pass: parallel metadata fetches. With HF_TOKEN we have plenty of
+    # rate-limit headroom for 8-16 concurrent requests; the 429 retry helper
+    # absorbs anything that does come back rate-limited.
+    workers = env_int("MODEL_MANAGER_HF_SEARCH_WORKERS", 12, minimum=1)
+
+    def _fetch(item: tuple[str, Any]):
+        repo_id, raw = item
         try:
             _hf_search_throttle()
             info = _hf_call_with_retry(api.model_info, repo_id=repo_id, files_metadata=True)
             total, files = _repo_files_from_info(info)
             lic = _card_license(info)
+            return repo_id, raw, total, files, lic, None
         except Exception as e:
-            total, files, lic = None, [], None
-            notes.append(f"metadata error: {type(e).__name__}: {e}")
+            return repo_id, raw, None, [], None, f"metadata error: {type(e).__name__}: {e}"
+
+    results: list[SearchResult] = []
+    if not candidates:
+        return results
+
+    if workers <= 1 or len(candidates) <= 2:
+        rows = [_fetch(c) for c in candidates]
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(workers, len(candidates))) as ex:
+            # Preserve input order so search results stay deterministic.
+            rows = list(ex.map(_fetch, candidates))
+
+    for repo_id, raw, total, files, lic, err in rows:
+        notes: list[str] = []
+        if err:
+            notes.append(err)
         results.append(SearchResult(
             index=0,
             source="hf",
             kind="model",
             repo_id=repo_id,
             size_bytes=total,
-            downloads=getattr(m, "downloads", None),
-            likes=getattr(m, "likes", None),
-            pipeline=getattr(m, "pipeline_tag", None),
-            updated=str(getattr(m, "lastModified", None) or ""),
+            downloads=getattr(raw, "downloads", None),
+            likes=getattr(raw, "likes", None),
+            pipeline=getattr(raw, "pipeline_tag", None),
+            updated=str(getattr(raw, "lastModified", None) or ""),
             license=lic,
             url=f"https://huggingface.co/{repo_id}",
             files=files,
             notes=notes,
-            raw=m,
+            raw=raw,
         ))
-        if candidate_limit is None and len(results) >= limit:
-            break
     return results
 
 
@@ -1866,34 +1915,55 @@ def search_hf_datasets(query: str, limit: int) -> list[SearchResult]:
     except Exception:
         from huggingface_hub import list_datasets
         datasets = list(list_datasets(search=query, limit=limit))
-    results: list[SearchResult] = []
+
+    candidates: list[tuple[str, Any]] = []
     for ds in datasets:
         repo_id = getattr(ds, "id", None) or getattr(ds, "repo_id", None)
-        if not repo_id:
-            continue
-        notes: list[str] = []
+        if repo_id:
+            candidates.append((repo_id, ds))
+
+    workers = env_int("MODEL_MANAGER_HF_SEARCH_WORKERS", 12, minimum=1)
+
+    def _fetch(item: tuple[str, Any]):
+        repo_id, raw = item
         try:
             _hf_search_throttle()
             info = _hf_call_with_retry(api.dataset_info, repo_id=repo_id, files_metadata=True)
             total, files = _repo_files_from_info(info)
             lic = _card_license(info)
+            return repo_id, raw, total, files, lic, None
         except Exception as e:
-            total, files, lic = None, [], None
-            notes.append(f"metadata error: {type(e).__name__}: {e}")
+            return repo_id, raw, None, [], None, f"metadata error: {type(e).__name__}: {e}"
+
+    results: list[SearchResult] = []
+    if not candidates:
+        return results
+
+    if workers <= 1 or len(candidates) <= 2:
+        rows = [_fetch(c) for c in candidates]
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(workers, len(candidates))) as ex:
+            rows = list(ex.map(_fetch, candidates))
+
+    for repo_id, raw, total, files, lic, err in rows:
+        notes: list[str] = []
+        if err:
+            notes.append(err)
         results.append(SearchResult(
             index=0,
             source="hf",
             kind="dataset",
             repo_id=repo_id,
             size_bytes=total,
-            downloads=getattr(ds, "downloads", None),
-            likes=getattr(ds, "likes", None),
-            updated=str(getattr(ds, "last_modified", None) or getattr(ds, "lastModified", None) or ""),
+            downloads=getattr(raw, "downloads", None),
+            likes=getattr(raw, "likes", None),
+            updated=str(getattr(raw, "last_modified", None) or getattr(raw, "lastModified", None) or ""),
             license=lic,
             url=f"https://huggingface.co/datasets/{repo_id}",
             files=files,
             notes=notes,
-            raw=ds,
+            raw=raw,
         ))
     return results
 
@@ -4177,6 +4247,113 @@ def selected_expected_files(result: SearchResult, allow_patterns: list[str] | No
     return list(result.files)
 
 
+_GGUF_FIRST_SHARD_RE = re.compile(r"-0*1-of-0*\d+\.gguf$", re.IGNORECASE)
+
+
+def _print_ram_estimate_for_gguf_selection(
+    result: SearchResult,
+    expected_files: list[tuple[str, int | None]],
+) -> None:
+    """If any selected file is a GGUF, fetch its header via HF Range request,
+    parse architecture metadata, and print a load-time RAM estimate at common
+    context lengths. Silent (no error) if any step fails — purely advisory."""
+    gguf_files = [(n, s) for n, s in expected_files if n.lower().endswith(".gguf")]
+    if not gguf_files:
+        return
+
+    # Pick a header source: first shard if split, else largest single GGUF.
+    header_source = None
+    for name, size in gguf_files:
+        if _GGUF_FIRST_SHARD_RE.search(name):
+            header_source = name
+            break
+    if header_source is None:
+        header_source = max(gguf_files, key=lambda x: x[1] or 0)[0]
+
+    # Total weight = sum of selected GGUFs (handles sharded models)
+    total_weight = sum(s or 0 for _, s in gguf_files)
+    if total_weight == 0:
+        return
+
+    try:
+        sys.path.insert(0, str(MODEL_MANAGER_SCRIPT_DIR))
+        from gguf_inspect import (  # type: ignore
+            fetch_gguf_header_bytes,
+            parse_gguf_metadata,
+            architecture_summary,
+            estimate_load_ram,
+            detect_machine_ram_bytes,
+            format_size_gb,
+        )
+    except ImportError:
+        return
+
+    token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACEHUB_API_TOKEN")
+    print()
+    print("Fetching GGUF header (~64 KB) for load-time RAM estimate…")
+    header_bytes = fetch_gguf_header_bytes(
+        repo_id=result.repo_id,
+        filename=header_source,
+        token=token,
+    )
+    if header_bytes is None:
+        print("  Could not fetch GGUF header (network/auth/HF Range not allowed) — skipping estimate")
+        return
+
+    try:
+        meta = parse_gguf_metadata(header_bytes)
+    except Exception as e:
+        print(f"  Could not parse GGUF metadata: {type(e).__name__}: {e}")
+        return
+
+    summary = architecture_summary(meta)
+    if not summary.get("arch") or not summary.get("block_count"):
+        print("  GGUF metadata incomplete — skipping estimate")
+        return
+
+    contexts = [4096, 8192, 16384, 32768]
+    max_ctx = summary.get("context_length")
+    if max_ctx and int(max_ctx) > 32768:
+        contexts.append(int(max_ctx))
+    contexts = sorted(set(contexts))
+
+    estimates = estimate_load_ram(total_weight, summary, contexts)
+    if not estimates:
+        print("  Architecture missing required fields — cannot estimate RAM")
+        return
+    machine_ram = detect_machine_ram_bytes()
+
+    print()
+    print("Load-time RAM estimate")
+    print("-" * 80)
+    arch = summary["arch"]
+    detail = f"Arch: {arch} ({summary['block_count']} layers, "
+    detail += f"{summary.get('attention.head_count_kv') or summary.get('attention.head_count')} KV heads"
+    if summary.get("expert_count"):
+        detail += f", {summary['expert_count']} experts"
+    detail += ")"
+    print(detail)
+    print(f"Weights: {human_size(total_weight)} ({len(gguf_files)} GGUF file{'s' if len(gguf_files) != 1 else ''})")
+    if machine_ram:
+        print(f"Machine RAM: {human_size(machine_ram)}")
+    print()
+    print(f"  {'Context':<10}{'fp16 KV':>10}{'q8 KV':>10}{'q4 KV':>10}    Verdict (q8 KV vs your RAM)")
+    for ctx, row in estimates.items():
+        q8 = row["q8"]
+        verdict = ""
+        if machine_ram:
+            headroom_gb = (machine_ram - q8) / 1024**3
+            if headroom_gb > 30:
+                verdict = "✓ comfortable"
+            elif headroom_gb > 10:
+                verdict = f"⚠ tight (~{int(headroom_gb)} GB headroom)"
+            elif headroom_gb > 0:
+                verdict = "⚠ very tight"
+            else:
+                verdict = "✗ exceeds RAM"
+        print(f"  {ctx:<10}{format_size_gb(row['fp16']):>10}{format_size_gb(row['q8']):>10}{format_size_gb(row['q4']):>10}    {verdict}")
+
+
 def predownload_risk_and_completeness_check(
     result: SearchResult,
     allow_patterns: list[str] | None,
@@ -4208,6 +4385,13 @@ def predownload_risk_and_completeness_check(
                 return False
     except Exception as e:
         print(f"WARN: could not check free space: {type(e).__name__}: {e}")
+
+    # Best-effort load-time RAM estimate (only for GGUF selections).
+    # Fetches a ~64 KB Range from HF to read the GGUF header — silent on any failure.
+    try:
+        _print_ram_estimate_for_gguf_selection(result, expected)
+    except Exception:
+        pass
 
     findings: list[dict[str, str]] = []
     selected_names = [name for name, _ in expected]
@@ -4834,17 +5018,33 @@ def run_search_flow(options: argparse.Namespace | None = None) -> None:
             else:
                 excluded_family_terms = prompt_model_family_exclusion_terms()
 
-        provider_search_terms = search_terms
         if kind in {"models", "both"}:
-            provider_search_terms = expand_search_terms_for_model_name_variants(provider_search_terms)
-            provider_search_terms = expand_search_terms_for_artifacts(provider_search_terms, selected_artifact_types)
-        pre_cap_count = len(provider_search_terms)
-        if pre_cap_count > _HF_SEARCH_MAX_TERMS:
-            provider_search_terms = provider_search_terms[:_HF_SEARCH_MAX_TERMS]
-            print(
-                f"Capping expanded search terms from {pre_cap_count} to {_HF_SEARCH_MAX_TERMS} "
-                f"(MODEL_MANAGER_HF_SEARCH_MAX_TERMS to override)."
-            )
+            # Expand each base search term independently so the cap is per-base,
+            # not global. With "Kimi-K2.6, DeepSeek, Grok" and a cap of 5, this
+            # produces 5 variants for each — not 5 total dominated by one base.
+            seen_terms: set[str] = set()
+            provider_search_terms = []
+            pre_cap_total = 0
+            capped_any = False
+            for base in search_terms:
+                expanded = expand_search_terms_for_model_name_variants([base])
+                expanded = expand_search_terms_for_artifacts(expanded, selected_artifact_types)
+                pre_cap_total += len(expanded)
+                if len(expanded) > _HF_SEARCH_MAX_TERMS:
+                    expanded = expanded[:_HF_SEARCH_MAX_TERMS]
+                    capped_any = True
+                for term in expanded:
+                    if term not in seen_terms:
+                        seen_terms.add(term)
+                        provider_search_terms.append(term)
+            if capped_any and pre_cap_total > len(provider_search_terms):
+                print(
+                    f"Capping expanded search terms from {pre_cap_total} to "
+                    f"{len(provider_search_terms)} ({_HF_SEARCH_MAX_TERMS} per base term; "
+                    f"MODEL_MANAGER_HF_SEARCH_MAX_TERMS to override)."
+                )
+        else:
+            provider_search_terms = list(search_terms)
         if provider_search_terms != search_terms:
             print("Expanded search with model naming variants and artifact filename terms:")
             for term in provider_search_terms[:20]:

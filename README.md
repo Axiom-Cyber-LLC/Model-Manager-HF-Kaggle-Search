@@ -10,6 +10,31 @@ This public repository was rebuilt from a sanitized export. Do not commit local 
 
 ## Recent changes
 
+### 2026-05-08 (later)
+
+**`model_manager.py`**
+- Search-term expansion is now **per-base-term capped** (default 5 per base, env var `MODEL_MANAGER_HF_SEARCH_MAX_TERMS`). Previously a global cap could silently drop entire base terms when multiple were given (`Kimi, DeepSeek, Grok` → all variants of Kimi only). Now each base you type gets its own slice of variants.
+- HF API metadata fetches during search are now **parallelized** (`MODEL_MANAGER_HF_SEARCH_WORKERS`, default 12). Replaces a sequential per-result `model_info()` loop. End-to-end search time drops ~10× on multi-term queries.
+- `MODEL_MANAGER_HF_SEARCH_DELAY_MS` defaults to **0** (no throttle). Throttle is only useful for ANONYMOUS callers; with an HF account — free OR Pro — `HF_TOKEN` raises rate limits enough that the throttle is unnecessary. The 429 retry helper still absorbs any genuine rate-limit hit. Override per-shell with `export MODEL_MANAGER_HF_SEARCH_DELAY_MS=150` (or one-off `MODEL_MANAGER_HF_SEARCH_DELAY_MS=150 modelmgr ...`) on anonymous machines that hit 429s.
+- `hfdownloader` (Go binary, multipart/chunked-parallel) is now the **default download path** for models. `MODEL_MANAGER_HFDOWNLOADER=0` opts out per-run. Datasets, artifact selections it cannot preserve cleanly, and any download error all fall back to `huggingface_hub.snapshot_download` automatically.
+- New CLI: **size-range filter accepts one-sided bounds** — `<8 GB`, `>50 GB`, `<=2 TB`, `>=100 MB`, `under 8 GB`, `over 50 GB`, `at least 100 GB`. Two-sided ranges and `any` still work.
+- New: pre-download **load-time RAM estimate** for GGUF selections. Fetches just the GGUF header (~64 KB Range request from HF), parses architecture metadata, and prints a context × KV-precision table with verdict against your detected machine RAM (macOS sysctl). Silently skipped on non-GGUF or fetch failure — never blocks downloads.
+- `DEFAULT_EXCLUDED_AUTHORS` is now empty (was `[DavidAU, TheBloke, mradermacher, bartowski]`). The previous list contradicted `DEFAULT_KNOWN_GOOD_OWNERS` and was not risk-justified. Per-search exclusions are still entered at the prompt or via the existing flag.
+
+**`Prepare_models_for_Lmstudio.py`**
+- New: **publisher/repo/ tree mirror** (`--mirror-models-flat`, default on) — hardlinks any `<publisher>/<repo>/<files>` trees from `--input` (the manager's working dir) into `--lmstudio-dir` (the LM Studio `downloadsFolder` read from `~/.lmstudio/settings.json`). Fixes the case where models the prep script lists as READY were invisible to LM Studio because the two paths had drifted apart.
+- New: **`--clean-symlinks`** — walks LM Studio model dirs for broken weight-file symlinks (target no longer exists). Prints `rm` commands grouped by parent dir; never deletes anything itself.
+- New: **`--interactive-broken`** — after the BROKEN report prints, prompt per-entry for `[r]esume / [d]elete / [s]kip / [q]uit`. Resume calls `huggingface_hub.snapshot_download` for that repo. Delete requires explicit "Are you sure?" confirmation, then queues a copy-pasteable `rm -rf` block at the end (does not auto-delete).
+- BROKEN report now includes the on-disk path under each entry on a `path:` continuation line.
+- `HF_CACHE_DIRS` now also honors `HF_HUB_CACHE` and `HF_HOME` env vars at startup, so moving the HF cache to a new location no longer requires editing this list.
+- READY listing now appends a per-entry **load-time RAM hint** for GGUF entries (`≈ N GB to load @ 8K (Q8 KV)`), parsed from the local GGUF header. Silently omitted when metadata can't be read.
+
+**`Prepare_models_for_Ollama.py`**
+- `--clean-orphans` now actually does what its docstring says — walks every Ollama manifest, parses its config + layer blob digests, and removes registrations whose backing blobs no longer exist on disk. Previously it only matched image/diffusion name patterns. Image-pattern removal is preserved as a first pass.
+
+**`gguf_inspect.py`** (new)
+- Self-contained GGUF metadata parser, RAM estimator, and machine-RAM detector. Used by `model_manager.py`'s pre-download estimate and `Prepare_models_for_Lmstudio.py`'s READY hint. Includes a `fetch_gguf_header_bytes()` helper that fetches the first ~64 KB of a GGUF via HTTP Range request (follows HF's LFS CDN redirect) so RAM estimates can run before any large-file download begins.
+
 ### 2026-05-08
 
 **`Prepare_models_for_Lmstudio.py`**

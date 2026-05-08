@@ -87,9 +87,23 @@ DEFAULT_MODELS_DIR = default_manager_models_dir(Path("<Your Model Directory>"))
 # were silently invisible). Deduped in scan_hf_cache by resolved real path so
 # the symlink between <REDACTED_PATH> and <REDACTED_PATH>
 # doesn't cause double-scanning.
-HF_CACHE_DIRS = extend_scan_roots([
-    Path("<Your Model Directory>"),  # primary (HF_HUB_CACHE)
-    Path("<Your Model Directory>/huggingface/hub"),  # secondary cache
+def _hf_cache_dirs_from_env() -> list[Path]:
+    """Read HF_HUB_CACHE and HF_HOME from env and return any cache hub paths
+    they imply. Empty list if the env vars are unset."""
+    out: list[Path] = []
+    hub = os.environ.get("HF_HUB_CACHE", "").strip()
+    if hub:
+        out.append(Path(hub).expanduser())
+    home = os.environ.get("HF_HOME", "").strip()
+    if home:
+        out.append(Path(home).expanduser() / "hub")
+    return out
+
+
+HF_CACHE_DIRS = extend_scan_roots(_hf_cache_dirs_from_env() + [
+    Path("<Your Model Directory>"),  # legacy primary
+    Path("<Your Model Directory>/huggingface/hub"),  # legacy alt
+    Path("<REDACTED_PATH>"),         # post-move location
     Path("<Your Model Directory>/huggingface/model"),
     Path.home() / ".cache" / "huggingface" / "hub",       # symlink fallback
     Path("<Your Model Directory>"),       # ModelScope cache
@@ -1400,6 +1414,153 @@ def migrate_hf_cache_dirs(lmstudio_dir: Path, dry_run: bool, cleanup: bool, resu
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Models-flat → LM Studio mirror
+#
+# `models_dir` (default: models-flat) is the manager's view, but LM Studio
+# reads from its own `downloadsFolder` (lmstudio_dir). When the two paths
+# differ, publisher/repo/ trees in models_dir are invisible to LM Studio.
+# This mirror walks models_dir, finds publisher/repo/<files> trees that
+# aren't already present in lmstudio_dir, and hardlinks the files in.
+# Same-volume → instant, zero extra disk.
+# ──────────────────────────────────────────────────────────────────────
+
+# Top-level names under models_dir that are NOT publisher dirs and should
+# be skipped during mirror (flat short-name bucket, staging, internal stores).
+_MIRROR_SKIP_TOPLEVEL = {
+    "local", "hf_downloads", ".incoming", ".cache",
+    "blobs", "manifests", "refs", "snapshots", ".studio_links",
+    "huggingface", "xet", "dataset",
+}
+
+
+def mirror_models_flat_to_lmstudio(
+    models_dir: Path,
+    lmstudio_dir: Path,
+    dry_run: bool,
+    results: Results,
+) -> None:
+    """
+    Mirror publisher/repo/ trees from `models_dir` into `lmstudio_dir` so LM
+    Studio's downloadsFolder actually sees them. Hardlinks when same-volume,
+    falls back to copy2 otherwise. Idempotent: skips repos whose destination
+    already has matching file sizes.
+
+    Skips:
+      - The flat-short-name bucket `local/<short>/` (LM Studio doesn't read
+        that layout — that's for the manager + Ollama).
+      - Anything starting with `.` or `models--` (HF cache style — handled
+        by migrate_hf_cache_dirs).
+      - Names in _MIRROR_SKIP_TOPLEVEL.
+    """
+    if not models_dir.is_dir() or not lmstudio_dir.exists():
+        return
+
+    try:
+        if models_dir.resolve() == lmstudio_dir.resolve():
+            return  # nothing to mirror, paths are the same
+    except (OSError, RuntimeError):
+        pass
+
+    try:
+        dest_dev = lmstudio_dir.stat().st_dev
+    except OSError:
+        dest_dev = None
+
+    for publisher_dir in sorted(models_dir.iterdir()):
+        if not publisher_dir.is_dir() or publisher_dir.is_symlink():
+            continue
+        name = publisher_dir.name
+        if name in _MIRROR_SKIP_TOPLEVEL:
+            continue
+        if name.startswith(".") or name.startswith("models--") or name.startswith("datasets--"):
+            continue
+
+        try:
+            repos = sorted(publisher_dir.iterdir())
+        except OSError:
+            continue
+
+        for repo_dir in repos:
+            if not repo_dir.is_dir() or repo_dir.is_symlink():
+                continue
+
+            try:
+                files = [f for f in repo_dir.iterdir()
+                         if (f.is_file() or f.is_symlink()) and not f.name.startswith(".")]
+            except OSError:
+                continue
+            if not files:
+                continue
+
+            display = f"{publisher_dir.name}/{repo_dir.name}"
+            dest_repo = lmstudio_dir / publisher_dir.name / repo_dir.name
+
+            # Idempotency: same files at same sizes already in destination.
+            if dest_repo.is_dir():
+                try:
+                    existing = {f.name: f.stat().st_size
+                                for f in dest_repo.iterdir() if f.is_file()}
+                except OSError:
+                    existing = {}
+                src_sizes: dict[str, int] = {}
+                for f in files:
+                    try:
+                        src_sizes[f.name] = f.resolve().stat().st_size
+                    except OSError:
+                        pass
+                if src_sizes and all(existing.get(n) == sz for n, sz in src_sizes.items()):
+                    continue
+
+            # Decide link strategy
+            try:
+                src_dev = repo_dir.stat().st_dev
+                can_hardlink = dest_dev is not None and src_dev == dest_dev
+            except OSError:
+                can_hardlink = False
+
+            method = "HARDLINK" if can_hardlink else "COPY"
+            total_size = 0
+            for f in files:
+                try:
+                    total_size += f.resolve().stat().st_size
+                except OSError:
+                    pass
+
+            print(
+                f"  MIRROR  {display}/  -> {dest_repo}  "
+                f"({len(files)} files, {format_size(total_size)}, {method})"
+            )
+
+            if dry_run:
+                results.fixed.append((display, repo_dir, dest_repo))
+                continue
+
+            try:
+                dest_repo.mkdir(parents=True, exist_ok=True)
+                for src in files:
+                    dst = dest_repo / src.name
+                    if dst.exists():
+                        continue
+                    try:
+                        real_src = src.resolve()
+                        if not real_src.is_file():
+                            continue
+                    except OSError:
+                        continue
+                    if can_hardlink:
+                        try:
+                            os.link(real_src, dst)
+                        except OSError:
+                            shutil.copy2(real_src, dst)
+                    else:
+                        shutil.copy2(real_src, dst)
+                results.fixed.append((display, repo_dir, dest_repo))
+            except OSError as e:
+                print(f"          ERROR: {e}")
+                results.errors.append((display, f"models-flat mirror failed: {e}"))
+
+
+# ──────────────────────────────────────────────────────────────────────
 # HuggingFace cache resume — re-download interrupted models--owner--repo/
 # dirs that have only a refs/ entry (no blobs/, no snapshots/).
 # ──────────────────────────────────────────────────────────────────────
@@ -1547,6 +1708,111 @@ def resume_broken_hf_downloads(dry_run: bool, workers: int = 1) -> None:
     print(f"  Resume summary: {len(success)} resumed, {len(failed)} failed")
 
 
+def _read_input(prompt: str) -> str:
+    """input() wrapper that handles EOF/Ctrl-C cleanly during interactive prompts."""
+    try:
+        return input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return "q"
+
+
+def interactive_broken_actions(broken: list[tuple[str, Path, str]]) -> None:
+    """
+    For each broken entry, prompt the user for an action: resume, delete, skip, quit.
+    Resume: calls huggingface_hub.snapshot_download for repos with parseable owner/repo.
+    Delete: requires explicit "Are you sure?" confirmation, then queues an rm command
+            (does NOT execute — printed at the end for user to run, per local convention).
+    """
+    try:
+        from huggingface_hub import snapshot_download
+        try:
+            from huggingface_hub.errors import (
+                GatedRepoError, RepositoryNotFoundError, HfHubHTTPError,
+            )
+        except ImportError:
+            from huggingface_hub.utils import (
+                GatedRepoError, RepositoryNotFoundError, HfHubHTTPError,
+            )
+        hf_available = True
+    except ImportError:
+        hf_available = False
+
+    print()
+    print("─" * 78)
+    print("Interactive broken-entry handler")
+    print(f"  {len(broken)} broken entries — actions: [r]esume  [d]elete  [s]kip  [q]uit")
+    print("─" * 78)
+
+    delete_queue: list[Path] = []
+
+    for idx, (name, path, reason) in enumerate(broken, 1):
+        print()
+        print(f"[{idx}/{len(broken)}]  {name}")
+        print(f"    path:   {path}")
+        print(f"    reason: {reason}")
+
+        while True:
+            choice = _read_input("    Action [r/d/s/q]? ").strip().lower()
+            if choice in {"r", "resume"}:
+                if not hf_available:
+                    print("    huggingface_hub not installed; cannot resume here. Skipping.")
+                    break
+                if "/" not in name:
+                    print("    Cannot derive owner/repo from name; skipping.")
+                    break
+                cache_root = path.parent if path.parent.is_dir() else path
+                print(f"    Resuming via huggingface_hub.snapshot_download(repo_id={name!r}, cache_dir={str(cache_root)!r})…")
+                try:
+                    snapshot_download(repo_id=name, cache_dir=str(cache_root))
+                    print(f"    ✓ Resumed: {name}")
+                except GatedRepoError:
+                    print("    ✗ Gated repo — set HF_TOKEN to access this model.")
+                except RepositoryNotFoundError:
+                    print("    ✗ Repo not found on HF.")
+                except HfHubHTTPError as e:
+                    status = getattr(getattr(e, "response", None), "status_code", "?")
+                    print(f"    ✗ HTTP error {status}")
+                except Exception as e:
+                    print(f"    ✗ {type(e).__name__}: {e}")
+                break
+            if choice in {"d", "delete"}:
+                confirm = _read_input(f"    Are you sure you want to delete {path}? [y/N] ").strip().lower()
+                if confirm in {"y", "yes"}:
+                    delete_queue.append(path)
+                    print(f"    Queued for deletion (you'll run the rm at the end): {path}")
+                else:
+                    print("    Cancelled.")
+                break
+            if choice in {"s", "skip", ""}:
+                break
+            if choice in {"q", "quit", "exit"}:
+                print("    Quitting interactive handler.")
+                if delete_queue:
+                    _print_delete_queue(delete_queue)
+                return
+            print("    Invalid choice. Use r, d, s, or q.")
+
+    if delete_queue:
+        _print_delete_queue(delete_queue)
+    else:
+        print()
+        print("No entries queued for deletion.")
+
+
+def _print_delete_queue(paths: list[Path]) -> None:
+    print()
+    print("─" * 78)
+    print(f"You queued {len(paths)} path(s) for deletion. Copy and run:")
+    print("─" * 78)
+    print()
+    print("rm -rf \\")
+    for i, p in enumerate(paths):
+        sep = " \\" if i < len(paths) - 1 else ""
+        print(f"  {str(p)!r}{sep}")
+    print()
+
+
 # Extra location where model_manager.py steers huggingface_hub.snapshot_download
 # refs/<revision> stubs to keep them out of the user's real HF_HUB_CACHE.
 _MODEL_MANAGER_STUB_CACHE = Path.home() / ".cache" / "model_manager" / "hf_refs_stubs"
@@ -1639,6 +1905,125 @@ def report_orphan_hf_stubs() -> None:
             sep = " \\" if i < len(names) - 1 else ""
             print(f"    {name}{sep}")
         print()
+
+
+# Model-file extensions we treat as "weights" when looking for dangling symlinks.
+_DANGLING_LINK_EXTS = (".gguf", ".safetensors", ".bin", ".pt", ".pth", ".mlmodel", ".mlpackage")
+
+_FIRST_SHARD_RE = re.compile(r"-0*1-of-0*\d+\.gguf$", re.IGNORECASE)
+
+
+def _find_primary_gguf_for_ready_entry(name: str, models_dir: Path, lmstudio_dir: Path) -> Path | None:
+    """For a READY entry like 'CohereForAI/c4ai-command-r-plus' or 'local/foo',
+    locate the primary GGUF (first shard if split, else largest single-file).
+    Returns None if not findable."""
+    candidates = [lmstudio_dir / name, models_dir / name]
+    for target in candidates:
+        try:
+            if not target.is_dir():
+                continue
+        except OSError:
+            continue
+        ggufs: list[Path] = []
+        try:
+            ggufs = list(target.rglob("*.gguf"))
+        except OSError:
+            continue
+        if not ggufs:
+            continue
+        # Prefer first shard of a split GGUF, else largest single file.
+        for g in ggufs:
+            if _FIRST_SHARD_RE.search(g.name):
+                return g
+        try:
+            return max(ggufs, key=lambda p: p.stat().st_size)
+        except OSError:
+            return ggufs[0]
+    return None
+
+
+def _sum_split_gguf_size(gguf_path: Path) -> int:
+    """If gguf_path is the first shard of a split set, sum sizes of all shards
+    in the same parent dir. Otherwise return just gguf_path's size."""
+    try:
+        if _FIRST_SHARD_RE.search(gguf_path.name):
+            parent = gguf_path.parent
+            shards = list(parent.glob("*.gguf"))
+            return sum(p.stat().st_size for p in shards if p.is_file())
+        return gguf_path.stat().st_size
+    except OSError:
+        return 0
+
+
+def report_dangling_symlinks(extra_roots: list[Path] | None = None) -> None:
+    """
+    Walk LM Studio model dirs (and any extra_roots) for *.gguf / *.safetensors /
+    weight-file symlinks that are broken (target no longer exists). Prints
+    `rm` commands grouped by parent dir. Read-only — does not delete.
+    """
+    roots = [
+        Path.home() / ".lmstudio" / "models",
+        DEFAULT_LMSTUDIO_DIR,
+        DEFAULT_MODELS_DIR,
+    ]
+    if extra_roots:
+        roots.extend(extra_roots)
+
+    seen_root_real: set[Path] = set()
+    broken: list[Path] = []
+
+    for root in roots:
+        if not root.is_dir():
+            continue
+        try:
+            real_root = root.resolve()
+        except (OSError, RuntimeError):
+            real_root = root
+        if real_root in seen_root_real:
+            continue
+        seen_root_real.add(real_root)
+
+        for ext in _DANGLING_LINK_EXTS:
+            for path in root.rglob(f"*{ext}"):
+                try:
+                    if not path.is_symlink():
+                        continue
+                    if path.exists():
+                        continue  # symlink target resolves
+                except OSError:
+                    continue
+                broken.append(path)
+
+    if not broken:
+        print("  No dangling weight-file symlinks found.")
+        return
+
+    print(f"  Found {len(broken)} dangling symlink(s) — target no longer exists.")
+    print(f"  These are residue from previous prepare runs (source models deleted/moved).")
+    print()
+    print(f"  To delete them, copy and run these commands:")
+    print()
+
+    by_parent: dict[Path, list[str]] = {}
+    for p in broken:
+        by_parent.setdefault(p.parent, []).append(p.name)
+    for parent in sorted(by_parent):
+        names = sorted(by_parent[parent])
+        print(f"  cd {parent} && rm \\")
+        for i, name in enumerate(names):
+            sep = " \\" if i < len(names) - 1 else ""
+            print(f"    {name!r}{sep}")
+        print()
+
+    # Also report empty parent dirs that would be left behind, so the user can rmdir if they want
+    empty_parent_candidates = sorted({p.parent for p in broken})
+    print("  After removing the symlinks above, these parent dirs may become empty:")
+    for parent in empty_parent_candidates:
+        print(f"    {parent}")
+    print()
+    print("  To remove now-empty dirs after the rm above, you can run:")
+    print(f"    find {' '.join(repr(str(p)) for p in seen_root_real)} \\")
+    print(f"      -type d -empty -depth -delete")
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -2079,6 +2464,12 @@ def main():
              "Default: enabled. Use --no-migrate-hf-cache to skip.",
     )
     parser.add_argument(
+        "--mirror-models-flat", action=argparse.BooleanOptionalAction, default=True,
+        help="Hardlink publisher/repo/ trees from --input (models-flat) into --lmstudio-dir "
+             "so LM Studio's downloadsFolder sees them. Default: enabled. "
+             "Use --no-mirror-models-flat to skip.",
+    )
+    parser.add_argument(
         "--lmstudio-dir", type=Path, default=DEFAULT_LMSTUDIO_DIR,
         help=f"Destination root for HF-cache migration (LM Studio's downloadsFolder). "
              f"Default: {DEFAULT_LMSTUDIO_DIR}",
@@ -2102,6 +2493,18 @@ def main():
         help="Scan HF cache roots for `models--*` dirs that contain only refs/ and no "
              "blobs/snapshots/ — bookkeeping residue from huggingface_hub.snapshot_download. "
              "Prints copy-pasteable rm commands; never deletes anything itself.",
+    )
+    parser.add_argument(
+        "--clean-symlinks", action="store_true",
+        help="Walk LM Studio model dirs (<REDACTED_PATH>, --lmstudio-dir, --input) for "
+             "broken weight-file symlinks (target no longer exists). Prints copy-pasteable "
+             "rm commands grouped by parent; never deletes anything itself.",
+    )
+    parser.add_argument(
+        "--interactive-broken", action="store_true",
+        help="After the BROKEN list prints, prompt per-entry for an action: "
+             "resume (re-download via huggingface_hub), delete (with 'Are you sure?' confirm; "
+             "prints rm commands, never auto-deletes), skip, or quit.",
     )
     parser.add_argument(
         "--clean-partial-downloads", action="store_true",
@@ -2177,6 +2580,10 @@ def main():
         print("Scanning for orphan HF cache stubs...")
         report_orphan_hf_stubs()
 
+    if args.clean_symlinks:
+        print("Scanning for dangling weight-file symlinks...")
+        report_dangling_symlinks(extra_roots=[args.lmstudio_dir.expanduser().resolve()])
+
     if args.resume_broken:
         print("Resuming broken HF cache downloads...")
         resume_broken_hf_downloads(args.dry_run, workers=args.resume_broken_workers)
@@ -2185,6 +2592,12 @@ def main():
         lmstudio_dir = args.lmstudio_dir.expanduser().resolve()
         print(f"Migrating HuggingFace cache dirs into {lmstudio_dir}...")
         migrate_hf_cache_dirs(lmstudio_dir, args.dry_run, args.cleanup_hf_source, results)
+
+    if args.mirror_models_flat:
+        lmstudio_dir = args.lmstudio_dir.expanduser().resolve()
+        if models_dir.resolve() != lmstudio_dir.resolve():
+            print(f"Mirroring publisher/repo/ trees from {models_dir} into {lmstudio_dir}...")
+            mirror_models_flat_to_lmstudio(models_dir, lmstudio_dir, args.dry_run, results)
 
     # Step 2: Scan loose model files and fix structure
     print("Scanning model files...")
@@ -2255,8 +2668,33 @@ def main():
 
     if results.ready:
         print(f"\nREADY ({len(results.ready)}):")
+        # Lazy import — only needed when there's something to print, and silent on failure.
+        _gguf_helpers = None
+        try:
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            import gguf_inspect as _gguf_helpers  # type: ignore
+        except ImportError:
+            pass
+
+        lmstudio_dir = args.lmstudio_dir.expanduser().resolve()
         for name, size, mtype in results.ready:
-            print(f"  . {name}  [{mtype}, {size}]")
+            line = f"  . {name}  [{mtype}, {size}]"
+            if _gguf_helpers and "GGUF" in mtype.upper():
+                gguf_path = _find_primary_gguf_for_ready_entry(
+                    name, models_dir, lmstudio_dir,
+                )
+                if gguf_path is not None:
+                    try:
+                        meta = _gguf_helpers.parse_gguf_metadata(gguf_path)
+                        summary = _gguf_helpers.architecture_summary(meta)
+                        total_weight = _sum_split_gguf_size(gguf_path)
+                        est = _gguf_helpers.estimate_load_ram(total_weight, summary, [8192])
+                        if est:
+                            q8_gb = est[8192]["q8"] / (1024 ** 3)
+                            line += f"   ≈ {q8_gb:.0f} GB to load @ 8K (Q8 KV)"
+                    except Exception:
+                        pass
+            print(line)
 
     if results.duplicates:
         print(f"\nDUPLICATES removed ({len(results.duplicates)}):")
@@ -2273,6 +2711,10 @@ def main():
         print(f"\nBROKEN ({len(results.broken)}):")
         for name, path, reason in results.broken:
             print(f"  X {name}: {reason}")
+            print(f"      path: {path}")
+
+        if args.interactive_broken:
+            interactive_broken_actions(results.broken)
 
     if results.errors:
         print(f"\nERRORS ({len(results.errors)}):")

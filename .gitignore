@@ -45,3 +45,4 @@ dist/
 *.pickle
 *.joblib
 *.bin
+export_manifest.json

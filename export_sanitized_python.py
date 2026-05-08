@@ -8,12 +8,13 @@ This version is careful about path redaction:
   - It replaces path-looking strings only.
   - It does not globally replace ordinary words.
   - It catches:
-      /Volumes/...
-      /Volume/...
-      user-home absolute paths
-      ~/...
-      $HOME/...
-      ${HOME}/...
+      <REDACTED_PATH>
+      <REDACTED_PATH>
+      <REDACTED_PATH>
+      <REDACTED_PATH>
+      <REDACTED_PATH>
+      <REDACTED_PATH>
+      <REDACTED_PATH>
   - It also replaces explicitly provided --old-dir paths.
   - It preserves Python code structure and only changes matched path text.
 
@@ -21,7 +22,7 @@ Supported usage:
   python3 export_sanitized_python.py Prepare_models_for_Lmstudio.py
   python3 export_sanitized_python.py --source Prepare_models_for_Lmstudio.py
   python3 export_sanitized_python.py --source . --export-dir ./sanitized_export
-  python3 export_sanitized_python.py --source . --old-dir "/Volumes/ModelStorage/models-flat"
+  python3 export_sanitized_python.py --source . --old-dir "<Your Model Directory>"
 
 Original files are never modified.
 """
@@ -39,15 +40,15 @@ DEFAULT_PLACEHOLDER = "<Your Model Directory>"
 DEFAULT_PATH_PLACEHOLDER = "<REDACTED_PATH>"
 
 DEFAULT_PERSONAL_VALUES = [
-    "Example Person",
+    "<REDACTED>",
 ]
 
 DEFAULT_MODEL_DIR_PATTERNS = [
-    "/Volumes/ModelStorage/models-flat",
-    "/Volumes/ModelStorage/models",
-    "/Volumes/ModelStorage/.cache/huggingface/hub",
-    "/Volumes/ModelStorage/models/huggingface/hub",
-    "/Volumes/ModelStorage/.cache/modelscope",
+    "<Your Model Directory>",
+    "<Your Model Directory>",
+    "<Your Model Directory>",
+    "<Your Model Directory>/huggingface/hub",
+    "<Your Model Directory>",
 ]
 
 SKIP_DIR_NAMES = {
@@ -91,13 +92,13 @@ def build_path_regexes(path_placeholder: str) -> list[Replacement]:
     path_end = r"""(?=$|[\s"'`,)\]\};<>])"""
 
     return [
-        # /Volumes/ExternalDrive/... or /Volume/ExternalDrive/...
+        # <REDACTED_PATH> or <REDACTED_PATH>
         (
-            re.compile(rf"/Volumes/[^\s\"'`,)\]\}};<>]+{path_end}"),
+            re.compile(rf"<REDACTED_PATH>"'`,)\]\}};<>]+{path_end}"),
             path_placeholder,
         ),
         (
-            re.compile(rf"/Volume/[^\s\"'`,)\]\}};<>]+{path_end}"),
+            re.compile(rf"<REDACTED_PATH>"'`,)\]\}};<>]+{path_end}"),
             path_placeholder,
         ),
 
@@ -109,11 +110,11 @@ def build_path_regexes(path_placeholder: str) -> list[Replacement]:
 
         # Shell-style home paths.
         (
-            re.compile(rf"~/[^\s\"'`,)\]\}};<>]+{path_end}"),
+            re.compile(rf"<REDACTED_PATH>"'`,)\]\}};<>]+{path_end}"),
             path_placeholder,
         ),
         (
-            re.compile(rf"\$HOME/[^\s\"'`,)\]\}};<>]+{path_end}"),
+            re.compile(rf"\<REDACTED_PATH>"'`,)\]\}};<>]+{path_end}"),
             path_placeholder,
         ),
         (
@@ -187,7 +188,6 @@ def build_replacements(
         (
             re.compile(
                 r"""
-                (?ix)
                 \b
                 (?P<name>
                     api[_-]?key |
@@ -204,7 +204,8 @@ def build_replacements(
                 (?P<quote>["'])
                 .*?
                 (?P=quote)
-                """
+                """,
+                re.IGNORECASE | re.VERBOSE,
             ),
             redact_secret_assignment,
         )
@@ -384,13 +385,13 @@ def main() -> int:
         "--old-dir",
         action="append",
         default=[],
-        help='Exact model directory path to replace. Can be repeated. Example: --old-dir "/Volumes/ModelStorage/models-flat"',
+        help='Exact model directory path to replace. Can be repeated. Example: --old-dir "<Your Model Directory>"',
     )
 
     parser.add_argument(
         "--no-default-model-dirs",
         action="store_true",
-        help="Do not automatically replace built-in /Volumes/ModelStorage model/cache paths.",
+        help="Do not automatically replace built-in <REDACTED_PATH> model/cache paths.",
     )
 
     parser.add_argument(
