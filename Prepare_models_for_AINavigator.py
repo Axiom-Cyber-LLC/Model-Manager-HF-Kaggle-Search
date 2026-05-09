@@ -38,11 +38,13 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from prepare_models_env import manager_scan_roots
+
 
 # ── Defaults ──────────────────────────────────────────────────────────
 
 HOME = Path.home()
-FLAT_ROOT = Path("/Volumes/ModelStorage/models-flat")
+FLAT_ROOT = Path("<Your Model Directory>")
 FLAT_MODELS = FLAT_ROOT / "local"
 RENAME_PLAN = FLAT_ROOT / "rename-plan.json"
 
@@ -50,6 +52,13 @@ AI_NAV_DIR = HOME / "Library" / "Application Support" / "ai-navigator"
 AI_NAV_CONFIG = AI_NAV_DIR / "config.json"
 AI_NAV_DB = AI_NAV_DIR / "ailauncher.db"
 AI_NAV_CATALOG = AI_NAV_DIR / "catalog.json"
+
+MODEL_FILE_SUFFIXES = {".gguf", ".safetensors"}
+GENERIC_LAYOUT_NAMES = {
+    "model", "models", "local", "locals", "huggingface", "hub",
+    "snapshots", "refs", "blobs", "downloads", "model_downloads",
+    ".cache", "cache", "huggingface.co",
+}
 
 _print_lock = threading.Lock()
 def _log(msg):
@@ -90,6 +99,31 @@ def extract_publisher_and_model(original: str):
     if publisher == "_image-models":
         return None
     return publisher, model
+
+
+def infer_publisher_and_model_from_dir(src_dir: Path):
+    """Best-effort identity inference for direct model dirs outside rename-plan."""
+    for anc in (src_dir, *src_dir.parents):
+        parsed = extract_publisher_and_model(anc.name)
+        if parsed:
+            return parsed
+
+    if "__" in src_dir.name:
+        publisher, model = src_dir.name.split("__", 1)
+        if publisher and model:
+            return publisher, model
+
+    publisher = src_dir.parent.name
+    model = src_dir.name
+    if (
+        publisher
+        and model
+        and publisher.lower() not in GENERIC_LAYOUT_NAMES
+        and model.lower() not in GENERIC_LAYOUT_NAMES
+    ):
+        return publisher, model
+
+    return "local", src_dir.name
 
 
 def sha256_of(path: Path, chunk=1 << 20) -> str:
@@ -392,21 +426,76 @@ def safe_symlink_dir(target: Path, link: Path, dry_run: bool) -> str:
 def discover_local_models(plan_path: Path, flat_models: Path):
     """
     Yield (hf_publisher, hf_model, short_name, src_dir) for every model in the
-    rename-plan that maps to a real HF publisher (not `local`/`_image-models`).
+    rename-plan plus any direct env-provided model roots that are not yet in
+    the plan. This lets freshly downloaded `owner__repo` directories register
+    immediately without requiring a flat-dir refresh first.
     """
-    if not plan_path.is_file():
-        return
-    plan = json.loads(plan_path.read_text())
-    for entry in plan.get("entries", []):
-        short = entry["short_name"]
-        src_dir = flat_models / short
-        if not src_dir.is_dir():
+    seen_dirs: set[Path] = set()
+    seen_ids: set[str] = set()
+
+    if plan_path.is_file():
+        plan = json.loads(plan_path.read_text())
+        for entry in plan.get("entries", []):
+            short = entry["short_name"]
+            src_dir = flat_models / short
+            if not src_dir.is_dir():
+                continue
+            pm = extract_publisher_and_model(entry.get("original", ""))
+            if not pm:
+                continue
+            publisher, model = pm
+            model_id = f"{publisher}/{model}"
+            try:
+                resolved = src_dir.resolve()
+            except OSError:
+                resolved = src_dir
+            if resolved in seen_dirs or model_id in seen_ids:
+                continue
+            seen_dirs.add(resolved)
+            seen_ids.add(model_id)
+            yield publisher, model, short, src_dir
+
+    # Effective scan roots: env-driven (manager_scan_roots) first, then a
+    # default fallback list so this script is self-sufficient when no
+    # rename-plan exists and no MODEL_MANAGER_DOWNLOAD_* env is set.
+    extra_default_roots = [
+        flat_models,                                                   # <Your Model Directory>
+        Path("<Your Model Directory>"),                           # LM Studio downloadsFolder
+        Path.home() / ".lmstudio" / "models",                          # LM Studio's own hub layout
+    ]
+    seen_root_real: set[Path] = set()
+    effective_roots: list[Path] = []
+    for r in list(manager_scan_roots()) + extra_default_roots:
+        try:
+            real = r.resolve()
+        except (OSError, RuntimeError):
+            real = r
+        if real in seen_root_real:
             continue
-        pm = extract_publisher_and_model(entry.get("original", ""))
-        if not pm:
+        seen_root_real.add(real)
+        effective_roots.append(r)
+
+    for scan_root in effective_roots:
+        if not scan_root.is_dir():
             continue
-        publisher, model = pm
-        yield publisher, model, short, src_dir
+        for suffix in MODEL_FILE_SUFFIXES:
+            for model_file in scan_root.rglob(f"*{suffix}"):
+                if not model_file.is_file():
+                    continue
+                src_dir = model_file.parent
+                try:
+                    resolved = src_dir.resolve()
+                except OSError:
+                    resolved = src_dir
+                if resolved in seen_dirs:
+                    continue
+                publisher, model = infer_publisher_and_model_from_dir(src_dir)
+                model_id = f"{publisher}/{model}"
+                if model_id in seen_ids:
+                    continue
+                seen_dirs.add(resolved)
+                seen_ids.add(model_id)
+                yield publisher, model, src_dir.name, src_dir
 
 
 def pick_primary_files(src_dir: Path, gguf_only: bool = False) -> list[Path]:
@@ -582,6 +671,12 @@ def inject(db: dict, entries: list[dict], dry_run: bool) -> tuple[int, int, int,
     coll = get_models_collection(db)
     entries = _dedupe_input_by_id(entries)
     valid_ids = {e.get("id") for e in entries if e.get("id")}
+    managed_roots = {FLAT_MODELS.parent.resolve(), FLAT_MODELS.resolve()}
+    for root in manager_scan_roots():
+        try:
+            managed_roots.add(root.resolve())
+        except OSError:
+            managed_roots.add(root)
 
     # Collapse pre-existing duplicates AND drop incompatible entries.
     seen: dict[str, int] = {}
@@ -595,11 +690,14 @@ def inject(db: dict, entries: list[dict], dry_run: bool) -> tuple[int, int, int,
         # so if the DB still has them they're stale (from before arch filtering).
         if mid and mid not in valid_ids:
             # Only remove if we previously INJECTED it (has a file with localPath
-            # pointing into /Volumes/ModelStorage/models-flat). Don't touch
+            # pointing into <Your Model Directory>). Don't touch
             # models AI Nav downloaded itself.
             files = m.get("files") or []
             is_ours = any(
-                str((f.get("localPath") or "")).startswith("/Volumes/ModelStorage/models-flat/")
+                any(
+                    str((f.get("localPath") or "")).startswith(str(root))
+                    for root in managed_roots
+                )
                 for f in files
             )
             if is_ours:

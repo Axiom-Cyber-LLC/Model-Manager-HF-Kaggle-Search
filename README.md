@@ -10,6 +10,12 @@ This public repository was rebuilt from a sanitized export. Do not commit local 
 
 ## Recent changes
 
+### 2026-05-08 (AI Navigator self-discovery)
+
+**`Prepare_models_for_AINavigator.py`**
+- Now self-sufficient when no `rename-plan.json` exists and no `MODEL_MANAGER_DOWNLOAD_*` env var is set. `discover_local_models` previously yielded 0 entries in that state — meaning AI Navigator's My Models view stayed empty even though dozens of models were on disk. Added a default scan-roots fallback that walks the FLAT_ROOT (`models-flat`), the LM Studio `downloadsFolder` (`/Volumes/SamsungSSDE/models`), and `~/.lmstudio/models/` when env-driven roots return nothing. Roots are deduped by resolved physical path.
+- Net effect on a typical setup: discovery jumps from 0 to "all your local GGUFs/safetensors". Models with newer architectures AI Nav's bundled llama.cpp can't load (gemma4, qwen35, qwen3.6, mistral3, gemma3, nemotron_h) are still skipped with a clear note.
+
 ### 2026-05-08 (risk-intel noise filter)
 
 **`model_manager.py`**
