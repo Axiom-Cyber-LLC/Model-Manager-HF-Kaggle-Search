@@ -129,6 +129,11 @@ INCOMING_DOWNLOAD_DIR = Path(os.getenv("MODEL_MANAGER_INCOMING_DIR", str(DEFAULT
 CACHE_DIR = Path(os.getenv("MODEL_MANAGER_CACHE_DIR", str(Path.home() / ".cache" / "model_manager"))).expanduser().resolve()
 LEADERBOARD_CACHE_PATH = CACHE_DIR / "leaderboard_cache.json"
 REPUTATION_CACHE_PATH = CACHE_DIR / "publisher_reputation.json"
+# Persisted in-flight download queue. Records get added before each download
+# and cleared on successful completion. Survives crashes/restarts so the
+# next modelmgr invocation can resume them without the user having to
+# remember and re-search for the repos.
+ACTIVE_DOWNLOADS_PATH = CACHE_DIR / "active_downloads.json"
 # huggingface_hub.snapshot_download writes a refs/<revision> stub to cache_dir even when
 # local_dir is set (the docstring claims cache_dir is unused but the code disagrees). Steer
 # those stubs into a throwaway dir so they never pollute HF_HUB_CACHE.
@@ -3818,15 +3823,224 @@ def download_hf_with_hfdownloader(
     return target
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Active downloads queue — persists across crashes/restarts
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _load_active_downloads() -> list[dict]:
+    """Return the list of currently-recorded in-flight downloads. Empty list
+    if file missing or unreadable. Never raises."""
+    try:
+        if not ACTIVE_DOWNLOADS_PATH.is_file():
+            return []
+        data = json.loads(ACTIVE_DOWNLOADS_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return [d for d in data if isinstance(d, dict)]
+    except (OSError, json.JSONDecodeError):
+        pass
+    return []
+
+
+def _save_active_downloads(records: list[dict]) -> None:
+    """Atomic write so a partial save can never corrupt the file."""
+    try:
+        ACTIVE_DOWNLOADS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix="active_downloads.", suffix=".tmp",
+                                   dir=str(ACTIVE_DOWNLOADS_PATH.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(records, f, indent=2)
+            os.replace(tmp, ACTIVE_DOWNLOADS_PATH)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except OSError:
+        pass  # best-effort; never block the download itself
+
+
+def _record_active_download(
+    repo_id: str,
+    kind: str,
+    revision: str,
+    allow_patterns: list[str] | None,
+    download_root: Path,
+    staging_path: Path,
+    downloader: str,
+) -> str:
+    """Add a record. Returns the record id so the caller can clear it later."""
+    rec_id = f"{int(time.time())}-{abs(hash((repo_id, downloader))) % 100000:05d}"
+    record = {
+        "id": rec_id,
+        "repo_id": repo_id,
+        "kind": kind,
+        "revision": revision,
+        "allow_patterns": list(allow_patterns) if allow_patterns else None,
+        "download_root": str(download_root),
+        "staging_path": str(staging_path),
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+        "downloader": downloader,
+    }
+    records = _load_active_downloads()
+    records.append(record)
+    _save_active_downloads(records)
+    return rec_id
+
+
+def _clear_active_download(rec_id: str) -> None:
+    records = _load_active_downloads()
+    new = [r for r in records if r.get("id") != rec_id]
+    if len(new) != len(records):
+        _save_active_downloads(new)
+
+
+def _prune_stale_active_downloads() -> list[dict]:
+    """Drop records whose staging_path no longer exists. Return the remaining
+    records (the still-resumable ones)."""
+    records = _load_active_downloads()
+    alive: list[dict] = []
+    for rec in records:
+        staging = rec.get("staging_path", "")
+        if staging and Path(staging).exists():
+            alive.append(rec)
+    if len(alive) != len(records):
+        _save_active_downloads(alive)
+    return alive
+
+
+def offer_resume_active_downloads() -> None:
+    """Called at the start of run_search_flow. Detects in-flight downloads
+    from a prior session, prompts the user, and dispatches the resumes.
+    Silent if there's nothing to resume."""
+    records = _prune_stale_active_downloads()
+    if not records:
+        return
+    print()
+    print("─" * 78)
+    print(f"Found {len(records)} unfinished download(s) from a previous session:")
+    for i, rec in enumerate(records, 1):
+        repo = rec.get("repo_id", "?")
+        kind = rec.get("kind", "?")
+        when = rec.get("started_at", "?")
+        downloader = rec.get("downloader", "?")
+        staging = rec.get("staging_path", "")
+        size_str = ""
+        try:
+            sp = Path(staging)
+            if sp.is_dir():
+                total = sum(p.stat().st_size for p in sp.rglob("*") if p.is_file())
+                size_str = f"  ({human_size(total)} on disk)"
+        except OSError:
+            pass
+        print(f"  {i}. {repo}  [{kind}, via {downloader}, started {when}]{size_str}")
+    print()
+    print("Resume options:")
+    print("  y   resume all")
+    print("  N   skip (default — records remain for next time)")
+    print("  q   forget all (delete records, partials stay on disk)")
+    print("  1,3 resume just those by number")
+    try:
+        ans = input("Choice [N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    if not ans or ans == "n":
+        return
+    if ans == "q":
+        _save_active_downloads([])
+        print("Cleared records. Partial files remain on disk for manual cleanup.")
+        return
+    if ans == "y":
+        to_resume = list(records)
+    else:
+        try:
+            picks = {int(t.strip()) for t in ans.split(",") if t.strip()}
+        except ValueError:
+            print("Unrecognized choice; skipping resume.")
+            return
+        to_resume = [records[i - 1] for i in sorted(picks) if 1 <= i <= len(records)]
+        if not to_resume:
+            print("No valid selections; skipping.")
+            return
+
+    for rec in to_resume:
+        try:
+            _resume_one_download(rec)
+        except Exception as e:
+            print(f"  ✗ resume failed for {rec.get('repo_id', '?')}: {type(e).__name__}: {e}")
+
+
+def _resume_one_download(rec: dict) -> None:
+    """Re-trigger a download from a recorded entry. Reuses the same code
+    path as a fresh download; resumption happens via the staging dir."""
+    repo_id = rec.get("repo_id")
+    kind = rec.get("kind", "model")
+    download_root_str = rec.get("download_root")
+    if not repo_id or not download_root_str:
+        return
+    download_root = Path(download_root_str)
+    allow_patterns = rec.get("allow_patterns")
+
+    print()
+    print(f"Resuming: {repo_id}")
+    if kind == "dataset":
+        result = build_exact_hf_result(repo_id, kind="dataset")
+    else:
+        result = build_exact_hf_result(repo_id, kind="model")
+    if not result:
+        print(f"  ✗ Could not look up {repo_id} on Hugging Face — skipping.")
+        return
+    annotate_results_with_leaderboard_cache([result])
+    assign_indexes([result])
+
+    target: Path | None = None
+    try:
+        if kind == "dataset":
+            target = download_kaggle_result(result, download_root, allow_patterns) \
+                if result.source == "kaggle" \
+                else download_hf_result(result, download_root, allow_patterns, artifacts=[])
+        else:
+            target = download_hf_result(result, download_root, allow_patterns, artifacts=[])
+    except Exception as e:
+        print(f"  ✗ resume error: {type(e).__name__}: {e}")
+        return
+
+    if target:
+        ok_to_install = post_download_audit(result, target, allow_patterns)
+        if ok_to_install:
+            final_target = final_download_path(result, download_root)
+            installed = promote_staged_download(target, final_target)
+            if installed and result.kind == "model":
+                offer_prepare_models(installed, download_root)
+
+
 def download_hf_result(
     result: SearchResult,
     download_root: Path,
     allow_patterns: list[str] | None,
     artifacts: list[Artifact] | None = None,
 ) -> Path | None:
+    # Record this download in the persistent queue so a crash/restart can
+    # surface it for resume. We compute the staging path the way the actual
+    # downloaders do so the stored path matches what would be on disk.
+    staging_path = staging_download_path(result, download_root)
+    rec_id = _record_active_download(
+        repo_id=result.repo_id,
+        kind=result.kind or "model",
+        revision="main",
+        allow_patterns=allow_patterns,
+        download_root=download_root,
+        staging_path=staging_path,
+        downloader=("hfdownloader" if (result.kind == "model" and hfdownloader_enabled()) else "snapshot_download"),
+    )
+
     if result.kind == "model" and hfdownloader_enabled():
         target = download_hf_with_hfdownloader(result, download_root, allow_patterns, artifacts)
         if target is not None:
+            _clear_active_download(rec_id)
             return target
         print("Falling back to huggingface_hub snapshot_download.")
 
@@ -3909,12 +4123,22 @@ def download_hf_result(
             )
             print(f"Retrying in {delay}s and resuming from the partial download at {target}.")
             time.sleep(delay)
+    _clear_active_download(rec_id)
     return target
 
 
 def download_kaggle_result(result: SearchResult, download_root: Path, allow_patterns: list[str] | None) -> Path | None:
     target = staging_download_path(result, download_root)
     target.mkdir(parents=True, exist_ok=True)
+    rec_id = _record_active_download(
+        repo_id=result.repo_id,
+        kind=result.kind or "dataset",
+        revision="main",
+        allow_patterns=allow_patterns,
+        download_root=download_root,
+        staging_path=target,
+        downloader="kaggle",
+    )
     print(f"Downloading Kaggle {result.kind}: {result.repo_id}")
     print(f"Target: {target}")
     if result.kind == "dataset":
@@ -3924,11 +4148,14 @@ def download_kaggle_result(result: SearchResult, download_root: Path, allow_patt
             matches = [name for name, _ in files if any(fnmatch.fnmatch(name, pat) for pat in allow_patterns)]
             if not matches:
                 print("No Kaggle files matched the chosen pattern.")
+                _clear_active_download(rec_id)
                 return None
             for name in matches:
                 api.dataset_download_file(result.repo_id, name, path=str(target), quiet=False)
+            _clear_active_download(rec_id)
             return target
         api.dataset_download_files(result.repo_id, path=str(target), unzip=True, quiet=False)
+        _clear_active_download(rec_id)
         return target
 
     try:
@@ -3941,10 +4168,12 @@ def download_kaggle_result(result: SearchResult, download_root: Path, allow_patt
                     shutil.copytree(path, target, dirs_exist_ok=True)
                 else:
                     shutil.copy2(path, target / path.name)
+            _clear_active_download(rec_id)
             return target
     except Exception as e:
         print(f"Kaggle model download failed or unavailable: {type(e).__name__}: {e}")
     print("Kaggle model download is unavailable in this environment/package version.")
+    _clear_active_download(rec_id)
     return None
 
 
@@ -5032,6 +5261,7 @@ def deep_hf_candidate_limit(limit: int) -> int:
 
 def run_search_flow(options: argparse.Namespace | None = None) -> None:
     check_airisk_mit_update_quietly()
+    offer_resume_active_downloads()
     download_root_override = None
     if options is not None and getattr(options, "download_root", None):
         download_root_override = Path(options.download_root).expanduser().resolve()

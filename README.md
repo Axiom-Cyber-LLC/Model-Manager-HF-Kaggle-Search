@@ -10,6 +10,20 @@ This public repository was rebuilt from a sanitized export. Do not commit local 
 
 ## Recent changes
 
+### 2026-05-08 (resumable download queue)
+
+**`model_manager.py`**
+- New: persistent in-flight download queue at `~/.cache/model_manager/active_downloads.json`. Each record has the repo id, kind, allow patterns, download root, staging path, and timestamp. Records are added right before each download starts and cleared after a successful promote-to-final. Atomic write (tempfile + os.replace) so a crash mid-write can't corrupt the file.
+- On every `modelmgr` startup (in `run_search_flow`), the script prunes records whose staging path no longer exists, then prompts:
+  ```
+  Found N unfinished download(s) from a previous session:
+    1. unsloth/grok-2-GGUF        [model, via hfdownloader, started 18:42]  (12.3 GB on disk)
+    2. lordx64/Qwen3.6-K2.6...     [model, via snapshot_download, started 19:15]  (3.2 GB on disk)
+  Resume options:  y=resume all  N=skip  q=forget  1,3=resume by number
+  ```
+- Resumes use the same code path as a fresh download — `download_hf_result` / `download_kaggle_result` — which means the existing partial-dir resume in hfdownloader and snapshot_download applies. No bytes re-downloaded.
+- Useful when downloading multiple models / datasets at once and the machine restarts, the SSH session drops, etc. — the queue remembers what was in flight so you don't have to re-search and re-pick.
+
 ### 2026-05-08 (AI Navigator self-discovery)
 
 **`Prepare_models_for_AINavigator.py`**
