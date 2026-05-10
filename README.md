@@ -10,6 +10,22 @@ This public repository was rebuilt from a sanitized export. Do not commit local 
 
 ## Recent changes
 
+### 2026-05-10 (existing-content exclusion)
+
+**`model_manager.py`**
+- New: **already-downloaded filter** during search setup. Before each search runs, the script asks for one or more directories whose contents should be hidden from results:
+  ```
+  Already-downloaded filter
+    Provide one or more directories — any owner/repo found inside
+    will be hidden from results. Separate with `:` or `,`. Press
+    Enter to skip. Set MODEL_MANAGER_EXISTING_DIRS to default this.
+  Directories with already-downloaded models/datasets:
+  ```
+- Each directory is walked (depth-bounded) and its contents are matched against four common layouts: `<publisher>/<repo>/`, `<owner>__<repo>/`, `models--<owner>--<repo>/`, and `datasets--<owner>--<repo>/`. The collected `<owner>/<repo>` set is then used to drop matching repos from both model and dataset results before they reach the picker.
+- Headless / scripted mode: pass `--exclude-existing-dirs <path>[,<path>...]` (colon or comma separated) to bypass the prompt. Default value can be set persistently via `MODEL_MANAGER_EXISTING_DIRS` env var, e.g. `export MODEL_MANAGER_EXISTING_DIRS="<Your Model Directory>:<REDACTED_PATH>/.lmstudio/models"`.
+- Sentinels recognized to skip the filter: empty input, `none`, `no`, `n`, `-`, `skip`. Output reports the count of repos hidden, e.g. `Filtered 7 already-present repo(s) from existing-dirs scan.`
+- Useful when re-searching for the same family of models — e.g. looking for new Qwen quants without re-seeing every Qwen variant you've already pulled. Equally applies to datasets.
+
 ### 2026-05-08 (resumable download queue)
 
 **`model_manager.py`**

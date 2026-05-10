@@ -1271,6 +1271,209 @@ def apply_term_exclusions(results: list[SearchResult], excluded: set[str]) -> li
     return filtered
 
 
+# ---------------------------------------------------------------------------
+# Existing-content exclusion: skip repos already present in user-specified dirs.
+# ---------------------------------------------------------------------------
+
+# Directory names we never want to descend into when scanning for existing repos.
+_EXISTING_DIR_SKIP_NAMES = {
+    ".git", ".cache", ".huggingface", ".locks", "__pycache__",
+    "node_modules", ".DS_Store",
+}
+
+
+def _normalize_repo_id_for_match(repo_id: str) -> str:
+    return repo_id.strip().lower()
+
+
+def _scan_dir_for_existing_repo_ids(directory: Path, max_depth: int = 4) -> set[str]:
+    """Walk a directory looking for already-downloaded HF/Kaggle repos.
+
+    Recognized layouts:
+      - <publisher>/<repo>/                           (LM Studio + flat layout)
+      - <publisher>__<repo>/                          (underscore-flat)
+      - models--<owner>--<repo>/                       (HF hub cache)
+      - datasets--<owner>--<repo>/                     (HF hub cache)
+      - <owner>--<repo>/  (without the models-/datasets- prefix)
+      - any directory containing a `config.json` whose grandparent yields owner/
+
+    We stop at max_depth from the requested directory to keep the walk bounded.
+    Returns a set of normalized "<owner>/<repo>" strings (lowercased).
+    """
+    if not directory or not directory.exists() or not directory.is_dir():
+        return set()
+    found: set[str] = set()
+    base = directory.resolve()
+    base_depth = len(base.parts)
+
+    def _add(owner: str | None, repo: str | None) -> None:
+        if not owner or not repo:
+            return
+        owner = owner.strip().strip(".").strip()
+        repo = repo.strip().strip(".").strip()
+        if not owner or not repo:
+            return
+        # Skip obvious file-extension noise that can sneak in if a path got
+        # mistakenly parsed as a repo segment.
+        if owner.startswith(".") or repo.startswith("."):
+            return
+        if "." in owner and len(owner) <= 5:
+            return
+        found.add(f"{owner.lower()}/{repo.lower()}")
+
+    def _walk(current: Path, depth: int) -> None:
+        if depth > max_depth:
+            return
+        try:
+            entries = list(current.iterdir())
+        except (PermissionError, FileNotFoundError, OSError):
+            return
+        for entry in entries:
+            try:
+                name = entry.name
+                if name in _EXISTING_DIR_SKIP_NAMES or name.startswith("."):
+                    continue
+                if not entry.is_dir():
+                    continue
+            except OSError:
+                continue
+            # Layout 1: HF hub cache  models--<owner>--<repo> / datasets--<owner>--<repo>
+            m = re.match(r"^(?:models|datasets)--([^-][^/]*?)--(.+)$", name)
+            if m:
+                _add(m.group(1), m.group(2))
+                continue
+            # Layout 2: bare hub form  <owner>--<repo>
+            m = re.match(r"^([^-][^/]*?)--(.+)$", name)
+            if m and "--" not in m.group(2):
+                _add(m.group(1), m.group(2))
+                # don't descend further: we already have what we need
+                continue
+            # Layout 3: underscore-flat  <owner>__<repo>
+            m = re.match(r"^([^_][^/]*?)__(.+)$", name)
+            if m and "__" not in m.group(2):
+                _add(m.group(1), m.group(2))
+                continue
+            # Layout 4: <publisher>/<repo>/ — recognized when this dir contains
+            # a child dir that itself looks like a repo (has model/data files
+            # or a config.json), so this dir is the publisher.
+            try:
+                children = [c for c in entry.iterdir() if c.is_dir() and not c.name.startswith(".")]
+            except (PermissionError, FileNotFoundError, OSError):
+                children = []
+            if children:
+                publisher_like = False
+                for child in children[:50]:
+                    try:
+                        names = {p.name for p in child.iterdir()}
+                    except (PermissionError, FileNotFoundError, OSError):
+                        continue
+                    if any(
+                        n == "config.json"
+                        or n.endswith(".gguf")
+                        or n.endswith(".safetensors")
+                        or n == "tokenizer.json"
+                        or n == "model.safetensors.index.json"
+                        for n in names
+                    ):
+                        _add(name, child.name)
+                        publisher_like = True
+                if publisher_like:
+                    continue
+            # Recurse if we still have depth budget; this is what catches deeply
+            # nested user trees like `<REDACTED_PATH><publisher>/<repo>`.
+            depth_now = len(entry.resolve().parts) - base_depth
+            if depth_now < max_depth:
+                _walk(entry, depth + 1)
+
+    _walk(base, 0)
+    return found
+
+
+def collect_existing_repo_ids(dirs: list[Path]) -> set[str]:
+    """Aggregate existing repo IDs across multiple user-supplied directories."""
+    out: set[str] = set()
+    for d in dirs:
+        try:
+            ids = _scan_dir_for_existing_repo_ids(d)
+        except Exception as e:  # noqa: BLE001 — never block search on a scan error
+            print(f"  Warning: could not scan {d}: {e}")
+            continue
+        if ids:
+            print(f"  Found {len(ids)} existing repo dir(s) in {d}")
+        out.update(ids)
+    return out
+
+
+def parse_existing_dirs_value(value: str | None) -> list[Path]:
+    """Parse a CLI/env list of paths separated by `:` or `,`. Empty → []."""
+    if not value:
+        return []
+    if value.strip().lower() in {"none", "no", "n", "-", "skip"}:
+        return []
+    parts: list[str] = []
+    # Allow both colon (PATH-style) and comma separators.
+    for chunk in re.split(r"[:,]+", value):
+        chunk = chunk.strip().strip('"\'')
+        if chunk and chunk.lower() not in {"none", "no", "n", "-", "skip"}:
+            parts.append(chunk)
+    out: list[Path] = []
+    for part in parts:
+        try:
+            p = Path(part).expanduser()
+        except (RuntimeError, ValueError):
+            print(f"  Skipping invalid path: {part!r}")
+            continue
+        if not p.exists():
+            print(f"  Skipping (does not exist): {p}")
+            continue
+        if not p.is_dir():
+            print(f"  Skipping (not a directory): {p}")
+            continue
+        out.append(p)
+    return out
+
+
+def prompt_existing_dirs() -> list[Path]:
+    """Ask the user once per search for directories whose contents should be
+    excluded from results. Returns [] if the user skips."""
+    default = os.environ.get("MODEL_MANAGER_EXISTING_DIRS", "").strip()
+    print()
+    print("Already-downloaded filter")
+    print("  Provide one or more directories — any owner/repo found inside")
+    print("  will be hidden from results. Separate with `:` or `,`. Press")
+    print("  Enter to skip. Set MODEL_MANAGER_EXISTING_DIRS to default this.")
+    if default:
+        print(f"  Default (from env): {default}")
+    raw = prompt("Directories with already-downloaded models/datasets", default).strip()
+    if not raw or raw.lower() in {"none", "no", "n", "-", "skip"}:
+        return []
+    return parse_existing_dirs_value(raw)
+
+
+def apply_existing_repo_exclusions(
+    results: list[SearchResult], existing_repo_ids: set[str]
+) -> list[SearchResult]:
+    if not existing_repo_ids:
+        return results
+    filtered: list[SearchResult] = []
+    hidden = 0
+    for r in results:
+        rid = _normalize_repo_id_for_match(r.repo_id)
+        if rid in existing_repo_ids:
+            hidden += 1
+            continue
+        # Owner/repo may differ in case from disk; also try normalized parts.
+        if "/" in rid:
+            owner, repo = rid.split("/", 1)
+            if f"{owner}/{repo}" in existing_repo_ids:
+                hidden += 1
+                continue
+        filtered.append(r)
+    if hidden:
+        print(f"Filtered {hidden} already-present repo(s) from existing-dirs scan.")
+    return filtered
+
+
 def choose_artifact_type_filters() -> set[str]:
     print()
     print("What model artifact types do you want to search for?")
@@ -5233,10 +5436,13 @@ def filter_and_rank_search_results(
     excluded_family_terms: list[str],
     hide_duplicate_families_pref: bool,
     quiet_family_no_match: bool = False,
+    excluded_existing_repo_ids: set[str] | None = None,
 ) -> list[SearchResult]:
     results = merge_search_results(results)
     results = apply_publisher_exclusions(results, excluded_publishers)
     results = apply_term_exclusions(results, excluded_terms)
+    if excluded_existing_repo_ids:
+        results = apply_existing_repo_exclusions(results, excluded_existing_repo_ids)
     if kind in {"models", "both"}:
         results = filter_results_by_artifact_types(results, selected_artifact_types)
         results = filter_results_by_model_size(results, model_size_range)
@@ -5337,6 +5543,22 @@ def run_search_flow(options: argparse.Namespace | None = None) -> None:
             excluded_terms = parse_excluded_terms_value(options.exclude_terms)
         else:
             excluded_terms = prompt_excluded_terms()
+        existing_dirs: list[Path] = []
+        if options is not None and getattr(options, "exclude_existing_dirs", None) is not None:
+            existing_dirs = parse_existing_dirs_value(options.exclude_existing_dirs)
+        else:
+            existing_dirs = prompt_existing_dirs()
+        excluded_existing_repo_ids: set[str] = set()
+        if existing_dirs:
+            print("Scanning existing-content directories for already-downloaded repos...")
+            excluded_existing_repo_ids = collect_existing_repo_ids(existing_dirs)
+            if excluded_existing_repo_ids:
+                print(
+                    f"Will hide {len(excluded_existing_repo_ids)} already-present repo(s) "
+                    f"from results."
+                )
+            else:
+                print("  No recognizable existing repo dirs found.")
         source = getattr(options, "search_source", None) if options is not None else None
         if source not in {"huggingface", "kaggle", "both"}:
             source = prompt_choice("Search source", ["huggingface", "kaggle", "both"], "huggingface")
@@ -5424,6 +5646,7 @@ def run_search_flow(options: argparse.Namespace | None = None) -> None:
             excluded_terms,
             excluded_family_terms,
             bool(hide_duplicate_families_pref),
+            excluded_existing_repo_ids=excluded_existing_repo_ids,
         )
         debug_log(
             "search-results",
@@ -5432,6 +5655,7 @@ def run_search_flow(options: argparse.Namespace | None = None) -> None:
             displayed_count=len(results),
             displayed_indexes=[r.index for r in results[:20]],
             displayed_repo_ids=[r.repo_id for r in results[:20]],
+            excluded_existing_repo_id_count=len(excluded_existing_repo_ids),
         )
         if raw_hit_count or merged_hit_count or results:
             summary_parts = [f"Showing {len(results)} result(s)"]
@@ -5473,6 +5697,7 @@ def run_search_flow(options: argparse.Namespace | None = None) -> None:
                     excluded_family_terms,
                     bool(hide_duplicate_families_pref),
                     quiet_family_no_match=True,
+                    excluded_existing_repo_ids=excluded_existing_repo_ids,
                 )
                 debug_log(
                     "search-results-deep-scan",
@@ -5579,6 +5804,15 @@ def main() -> int:
     ap.add_argument("--exclude-publishers", help="Comma-separated authors/publishers to exclude, or none")
     ap.add_argument("--exclude-terms", help="Comma-separated terms/tags to exclude, or none")
     ap.add_argument("--exclude-families", help="Comma-separated model families to exclude, or none")
+    ap.add_argument(
+        "--exclude-existing-dirs",
+        help=(
+            "Colon- or comma-separated directories whose already-downloaded "
+            "<owner>/<repo>, <owner>__<repo>, models--<owner>--<repo>, and "
+            "datasets--<owner>--<repo> entries will be hidden from results. "
+            "Defaults from MODEL_MANAGER_EXISTING_DIRS env var."
+        ),
+    )
     ap.add_argument("--search-source", choices=["huggingface", "kaggle", "both"], help="Search source")
     ap.add_argument("--result-limit", type=int, help="Results per source/type/search term")
     ap.add_argument("--page-size", type=int, help="Displayed result batch size")
