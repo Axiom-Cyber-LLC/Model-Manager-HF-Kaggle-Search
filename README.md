@@ -10,6 +10,37 @@ This public repository was rebuilt from a sanitized export. Do not commit local 
 
 ## Recent changes
 
+### 2026-05-10 (later — scanner UX, incoming-dir relocation)
+
+**`model_manager.py`**
+
+Three changes solving a related cluster of papercuts:
+
+1. **`.incoming/` default moved out of the download root.** `INCOMING_DOWNLOAD_DIR` used to default to `<DEFAULT_DOWNLOAD_DIR>/.incoming/`. When `DEFAULT_DOWNLOAD_DIR` doubles as LM Studio's `downloadsFolder`, an interrupted dataset (RLHF corpora are 18,000+ tiny JSON shards) silently pushes the directory past LM Studio's hard 7,000-file scanner cap, after which **My Models reports 0 entries** with no UI indication of why. New default is a sibling: `<DEFAULT_DOWNLOAD_DIR>.parent / ".cache" / "model_manager_incoming"`. Existing `MODEL_MANAGER_INCOMING_DIR` env var still wins.
+
+2. **Startup warning when a legacy `.incoming/` is detected inside the download root.** New `warn_if_incoming_inside_download_root()` runs at the top of `run_search_flow`. If it finds files in the old child path it prints a banner with: the full file count, the new sibling path, and the exact `mv` + LM Studio rescan commands the user can run. Suppress with `MODEL_MANAGER_SUPPRESS_INCOMING_WARNING=1`. Per the no-`rm` policy this script never deletes user data — it only prints what to run.
+
+3. **Session-level security-scan preference + per-scanner status banner.** Previously the prompt `Run external security/audit tools against the staged download? [Y/n]` defaulted to Yes and ran after EVERY download. Easy to Enter past without seeing any failure detail buried in scanner output. Now:
+   - Choose once at the start of a session via the new prompt or via `--scan-after-download {ask,always,never}` (env: `MODEL_MANAGER_SCAN_AFTER_DOWNLOAD`). Set to `always` and you never see the prompt again. Set to `never` and scanners are skipped entirely (useful when you already know they're broken).
+   - After the scan(s) finish, a clear summary banner prints regardless of which scanners ran:
+     ```
+     ==============================================================================
+     Scanner summary
+     ==============================================================================
+       [PASS   ] modelaudit — rc=0
+       [FAIL   ] modelscan — rc=1 (last line: ImportError: ...)
+       [TIMEOUT] skill-scanner — killed after 600s
+       [SKIP   ] ModelGuard — not found / not usable
+       totals: 1 pass · 1 fail · 0 high-risk · 1 timeout
+       Note: failing scanners do NOT automatically block install — they only
+       generate WARNs. If they have been silently failing, fix the tool / re-run
+       with `MODEL_MANAGER_SCAN_AFTER_DOWNLOAD=never` to skip them while you debug.
+     ==============================================================================
+     ```
+   - Outcome statuses: `PASS` (rc=0), `FAIL` (non-zero exit, plain), `ERROR` (non-zero with usage/invocation error in stderr), `HIGH` (non-zero with high-risk language in output → still emits a HIGH finding), `TIMEOUT` (killed by watchdog), `EXC` (Python exception starting the process), `SKIP` (tool not found or duplicate command).
+
+The prompt now reads `Run security scan after each successful download? [always/never/ask-per-download]`. Default is `always`.
+
 ### 2026-05-10 (existing-content exclusion)
 
 **`model_manager.py`**

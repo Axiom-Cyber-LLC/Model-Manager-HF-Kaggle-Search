@@ -125,7 +125,20 @@ PREP_APP_ORDER = [
 #   kaggle/model/<owner>__<model>/
 #   kaggle/dataset/<owner>__<dataset>/
 DEFAULT_DOWNLOAD_DIR = Path(os.getenv("MODEL_MANAGER_DOWNLOAD_DIR", "<Your Model Directory>")).expanduser().resolve()
-INCOMING_DOWNLOAD_DIR = Path(os.getenv("MODEL_MANAGER_INCOMING_DIR", str(DEFAULT_DOWNLOAD_DIR / ".incoming"))).expanduser().resolve()
+# Default staging area for in-flight downloads. **Important:** keep this
+# OUTSIDE DEFAULT_DOWNLOAD_DIR. When DEFAULT_DOWNLOAD_DIR is also LM Studio's
+# downloadsFolder, an `.incoming/` child directory rapidly accumulates many
+# small files (RLHF datasets are 18k+ JSON shards, etc.) and pushes the
+# downloadsFolder past LM Studio's 7,000-file scanner cap, causing My Models
+# to silently show 0 models. The default below puts staging as a sibling of
+# the download root. Override with MODEL_MANAGER_INCOMING_DIR.
+def _default_incoming_dir(download_dir: Path) -> Path:
+    parent = download_dir.parent if download_dir.parent != download_dir else download_dir
+    return parent / ".cache" / "model_manager_incoming"
+
+INCOMING_DOWNLOAD_DIR = Path(
+    os.getenv("MODEL_MANAGER_INCOMING_DIR", str(_default_incoming_dir(DEFAULT_DOWNLOAD_DIR)))
+).expanduser().resolve()
 CACHE_DIR = Path(os.getenv("MODEL_MANAGER_CACHE_DIR", str(Path.home() / ".cache" / "model_manager"))).expanduser().resolve()
 LEADERBOARD_CACHE_PATH = CACHE_DIR / "leaderboard_cache.json"
 REPUTATION_CACHE_PATH = CACHE_DIR / "publisher_reputation.json"
@@ -3701,10 +3714,31 @@ def run_external_security_tools(target: Path) -> list[dict[str, str]]:
 
     Scanner failures are scanner WARNs, not model DANGERs. A model should only become
     DANGER/BLOCKER when a scanner output contains a clear high-risk finding.
+
+    Honors `set_session_scan_preference()`: True → run silently; False → skip
+    silently; None → fall back to per-download prompt (legacy).
     """
     findings: list[dict[str, str]] = []
-    if not prompt_bool("Run external security/audit tools against the staged download?", True):
+    pref = get_session_scan_preference()
+    if pref is False:
+        print("Security scan: SKIP (session preference = never)")
         return findings
+    if pref is None:
+        # Legacy per-download prompt — only reached if no upfront preference
+        # was set. Default Yes preserved for back-compat.
+        if not prompt_bool("Run external security/audit tools against the staged download?", True):
+            return findings
+    # else: pref is True — run without prompting
+    # Per-scanner outcome tracker. Status is one of:
+    #   PASS    — rc==0
+    #   HIGH    — rc!=0 with high-risk language in output
+    #   FAIL    — rc!=0, plain non-zero exit (this is the "always exits 1" case)
+    #   ERROR   — invocation/usage error (low-signal stderr)
+    #   TIMEOUT — killed by watchdog
+    #   EXC     — Python exception starting/wrapping the subprocess
+    #   SKIP    — tool not found / duplicate command
+    # (label, status, detail)
+    scanner_outcomes: list[tuple[str, str, str]] = []
     seen_commands: set[tuple[str, ...]] = set()
     high_risk_re = re.compile(r"\b(malware|malicious|backdoor|rce|remote code execution|trojan|stealer|exploit)\b", re.I)
     low_signal_re = re.compile(r"(unrecognized arguments|usage:|error: argument|invalid option|unknown option)", re.I)
@@ -3712,10 +3746,12 @@ def run_external_security_tools(target: Path) -> list[dict[str, str]]:
         scanner = find_tool_command(tool, target)
         if not scanner:
             print(f"SKIP tool not found/usable: {tool}")
+            scanner_outcomes.append((tool, "SKIP", "not found / not usable"))
             continue
         cmd_key = tuple(scanner.cmd)
         if cmd_key in seen_commands:
             print(f"SKIP duplicate scanner command: {scanner.label}")
+            scanner_outcomes.append((scanner.label, "SKIP", "duplicate command"))
             continue
         seen_commands.add(cmd_key)
         print()
@@ -3770,29 +3806,64 @@ def run_external_security_tools(target: Path) -> list[dict[str, str]]:
 
             if killed_by_timeout["flag"]:
                 findings.append({"severity": "WARN", "message": f"scanner killed after {scanner_timeout}s timeout: {scanner.label} (set MODEL_MANAGER_SCANNER_TIMEOUT_S to extend)"})
+                scanner_outcomes.append((scanner.label, "TIMEOUT", f"killed after {scanner_timeout}s"))
                 try:
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     pass
                 continue
             rc = proc.wait(timeout=10)
-            if rc not in (0, None):
+            if rc in (0, None):
+                scanner_outcomes.append((scanner.label, "PASS", "rc=0"))
+            else:
                 if saw_invocation_error:
                     findings.append({"severity": "WARN", "message": f"scanner invocation error from {scanner.label}: rc={rc}"})
+                    last = recent_lines[-1] if recent_lines else ""
+                    scanner_outcomes.append((scanner.label, "ERROR", f"rc={rc} (usage/invocation; last line: {last[:100]})"))
                 elif risky_hits:
                     findings.append({"severity": "HIGH", "message": f"scanner {scanner.label} returned rc={rc} with high-risk language; review output"})
+                    scanner_outcomes.append((scanner.label, "HIGH", f"rc={rc}, {len(risky_hits)} risky hit(s)"))
                 else:
                     findings.append({"severity": "WARN", "message": f"scanner reported non-zero exit from {scanner.label}: rc={rc}"})
+                    last = recent_lines[-1] if recent_lines else ""
+                    scanner_outcomes.append((scanner.label, "FAIL", f"rc={rc} (last line: {last[:100]})"))
             for hit in risky_hits[:5]:
                 findings.append({"severity": "HIGH", "message": f"scanner output high-risk term from {scanner.label}: {hit}"})
         except subprocess.TimeoutExpired:
             findings.append({"severity": "WARN", "message": f"scanner timed out: {scanner.label}"})
+            scanner_outcomes.append((scanner.label, "TIMEOUT", "subprocess.TimeoutExpired"))
             try:
                 proc.kill()  # type: ignore[name-defined]
             except Exception:
                 pass
         except Exception as e:
             findings.append({"severity": "WARN", "message": f"scanner failed {scanner.label}: {type(e).__name__}: {e}"})
+            scanner_outcomes.append((scanner.label, "EXC", f"{type(e).__name__}: {e}"))
+
+    # Always print a one-screen scanner summary so the user can see at a glance
+    # which tools passed, failed, timed out, etc. The user's prior complaint
+    # was that scanner exits-1 were buried in long output and they would hit
+    # Enter past it without realizing the scan never ran clean.
+    print()
+    print("=" * 78)
+    print("Scanner summary")
+    print("=" * 78)
+    if not scanner_outcomes:
+        print("  (no scanners ran — all SKIPPED or none configured)")
+    else:
+        for label, status, detail in scanner_outcomes:
+            print(f"  [{status:<7}] {label}{' — ' + detail if detail else ''}")
+        ok = sum(1 for _, s, _ in scanner_outcomes if s == "PASS")
+        bad = sum(1 for _, s, _ in scanner_outcomes if s in {"FAIL", "ERROR", "EXC"})
+        risky = sum(1 for _, s, _ in scanner_outcomes if s == "HIGH")
+        timed = sum(1 for _, s, _ in scanner_outcomes if s == "TIMEOUT")
+        print(f"  totals: {ok} pass · {bad} fail · {risky} high-risk · {timed} timeout")
+        if bad and not risky:
+            print("  Note: failing scanners do NOT automatically block install — "
+                  "they only generate WARNs. If they have been silently failing, "
+                  "fix the tool / re-run with `MODEL_MANAGER_SCAN_AFTER_DOWNLOAD=never` "
+                  "to skip them entirely while you debug.")
+    print("=" * 78)
     return findings
 
 # -----------------------------------------------------------------------------
@@ -3810,7 +3881,9 @@ def partial_download_name(result: SearchResult) -> str:
 
 
 def staging_download_path(result: SearchResult, download_root: Path) -> Path:
-    incoming_root = Path(os.getenv("MODEL_MANAGER_INCOMING_DIR", str(download_root / ".incoming"))).expanduser().resolve()
+    incoming_root = Path(
+        os.getenv("MODEL_MANAGER_INCOMING_DIR", str(_default_incoming_dir(download_root)))
+    ).expanduser().resolve()
     provider_root = incoming_root / ("huggingface" if result.source == "hf" else "kaggle") / result.kind
     preferred = provider_root / partial_download_name(result)
     if preferred.exists():
@@ -4112,6 +4185,143 @@ def _prune_stale_active_downloads() -> list[dict]:
     if len(alive) != len(records):
         _save_active_downloads(alive)
     return alive
+
+
+# ---------------------------------------------------------------------------
+# Session-level security-scan preference
+# ---------------------------------------------------------------------------
+# Set once at the start of a session by `prompt_session_scan_preference()` (or
+# `--scan-after-download {ask,always,never}`), read by `run_external_security_tools`
+# so the user is not prompted per-download. The user kept hitting Enter through
+# the per-download prompt and triggering a scanner that has been intermittently
+# exiting non-zero — this consolidates the choice and surfaces failures.
+#
+# Values:
+#   None  → ask per-download (legacy behavior)
+#   True  → always run scanners after each successful download
+#   False → never run scanners
+_SCAN_AFTER_DOWNLOAD_PREF: bool | None = None
+
+
+def set_session_scan_preference(pref: bool | None) -> None:
+    global _SCAN_AFTER_DOWNLOAD_PREF
+    _SCAN_AFTER_DOWNLOAD_PREF = pref
+
+
+def get_session_scan_preference() -> bool | None:
+    return _SCAN_AFTER_DOWNLOAD_PREF
+
+
+def _parse_scan_after_download_choice(value: str | None) -> bool | None | str:
+    """Returns True / False / None / 'ask'. None means env wasn't set."""
+    if value is None:
+        return None
+    v = value.strip().lower()
+    if v in {"always", "yes", "y", "1", "true", "on", "run"}:
+        return True
+    if v in {"never", "no", "n", "0", "false", "off", "skip"}:
+        return False
+    if v in {"ask", "prompt"}:
+        return "ask"
+    return None
+
+
+def prompt_session_scan_preference(
+    explicit: bool | None | str = None,
+) -> bool | None:
+    """Choose ONCE per session whether to run external scanners after each
+    successful download. Reads MODEL_MANAGER_SCAN_AFTER_DOWNLOAD as default
+    (always / never / ask) if `explicit` is not provided. Returns the value
+    set via `set_session_scan_preference`."""
+    if explicit is None:
+        explicit = _parse_scan_after_download_choice(
+            os.environ.get("MODEL_MANAGER_SCAN_AFTER_DOWNLOAD")
+        )
+    if explicit is True:
+        print("Security scan after each download: ALWAYS (run, no per-download prompt)")
+        set_session_scan_preference(True)
+        return True
+    if explicit is False:
+        print("Security scan after each download: NEVER (skip, no per-download prompt)")
+        set_session_scan_preference(False)
+        return False
+    # explicit is "ask" or None — fall through to interactive
+    print()
+    print("Security scan preference for this session")
+    print("  External scanners (modelaudit, modelscan, ModelGuard, skill-scanner) run AFTER each")
+    print("  successful download. Pick once for the whole session — won't re-prompt per download.")
+    print("  Override anytime via MODEL_MANAGER_SCAN_AFTER_DOWNLOAD={always,never,ask} or")
+    print("  --scan-after-download {always,never,ask}.")
+    choice = prompt_choice(
+        "Run security scan after each successful download?",
+        ["always", "never", "ask-per-download"],
+        "always",
+    )
+    if choice == "always":
+        set_session_scan_preference(True)
+        return True
+    if choice == "never":
+        set_session_scan_preference(False)
+        return False
+    set_session_scan_preference(None)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Startup warning: legacy `.incoming/` inside the download root
+# ---------------------------------------------------------------------------
+def warn_if_incoming_inside_download_root() -> None:
+    """Older defaults put `INCOMING_DOWNLOAD_DIR` inside `DEFAULT_DOWNLOAD_DIR`.
+    When DEFAULT_DOWNLOAD_DIR is also LM Studio's downloadsFolder, .incoming/
+    can balloon past LM Studio's 7,000-file scanner cap (an interrupted RLHF
+    dataset alone is 18k+ tiny shards) and silently break My Models. The
+    default has been moved to a sibling, but a stale `.incoming/` from a
+    pre-fix run will still sit inside the download root. Detect and warn
+    on every startup until the user moves it. Suppress with
+    MODEL_MANAGER_SUPPRESS_INCOMING_WARNING=1."""
+    if os.environ.get("MODEL_MANAGER_SUPPRESS_INCOMING_WARNING", "").strip().lower() in {
+        "1", "yes", "y", "true", "on",
+    }:
+        return
+    legacy_incoming = DEFAULT_DOWNLOAD_DIR / ".incoming"
+    if not legacy_incoming.exists() or not legacy_incoming.is_dir():
+        return
+    try:
+        # Cheap check — count files up to 50, then bail. If 0, nothing to warn about.
+        count = 0
+        for _ in legacy_incoming.rglob("*"):
+            count += 1
+            if count >= 50:
+                break
+    except (PermissionError, OSError):
+        count = -1
+    if count == 0:
+        return
+    print()
+    print("=" * 78)
+    print("WARNING: legacy `.incoming/` directory found inside download root")
+    print("=" * 78)
+    print(f"  Path: {legacy_incoming}")
+    print(f"  Files inside: {count}{'+' if count >= 50 else ''}")
+    print()
+    print("  If your download root doubles as LM Studio's downloadsFolder, this")
+    print("  staging directory can blow past LM Studio's 7,000-file scanner cap")
+    print("  and cause My Models to silently show 0 entries.")
+    print()
+    print("  The default staging path is now:")
+    print(f"    {INCOMING_DOWNLOAD_DIR}")
+    print("  (sibling of download root, NOT a child).")
+    print()
+    print("  Recommended cleanup (you run; this script never deletes user data):")
+    print(f"    mv {legacy_incoming} {INCOMING_DOWNLOAD_DIR}")
+    print(f"    # then in LM Studio, force a rescan:")
+    print(f"    osascript -e 'quit app \"LM Studio\"'")
+    print(f"    rm <REDACTED_PATH>")
+    print(f"    open '/Applications/LM Studio.app'")
+    print()
+    print("  Suppress this warning: export MODEL_MANAGER_SUPPRESS_INCOMING_WARNING=1")
+    print("=" * 78)
+    print()
 
 
 def offer_resume_active_downloads() -> None:
@@ -5467,6 +5677,15 @@ def deep_hf_candidate_limit(limit: int) -> int:
 
 def run_search_flow(options: argparse.Namespace | None = None) -> None:
     check_airisk_mit_update_quietly()
+    warn_if_incoming_inside_download_root()
+    # Set the session-level scanner preference once, up front. Honors
+    # --scan-after-download {ask,always,never} CLI flag and
+    # MODEL_MANAGER_SCAN_AFTER_DOWNLOAD env var.
+    explicit_scan_pref: bool | None | str = None
+    if options is not None:
+        cli_value = getattr(options, "scan_after_download", None)
+        explicit_scan_pref = _parse_scan_after_download_choice(cli_value)
+    prompt_session_scan_preference(explicit_scan_pref)
     offer_resume_active_downloads()
     download_root_override = None
     if options is not None and getattr(options, "download_root", None):
@@ -5811,6 +6030,17 @@ def main() -> int:
             "<owner>/<repo>, <owner>__<repo>, models--<owner>--<repo>, and "
             "datasets--<owner>--<repo> entries will be hidden from results. "
             "Defaults from MODEL_MANAGER_EXISTING_DIRS env var."
+        ),
+    )
+    ap.add_argument(
+        "--scan-after-download",
+        choices=["ask", "always", "never"],
+        help=(
+            "Whether to run external security scanners (modelaudit, modelscan, "
+            "ModelGuard, skill-scanner) after each successful download. Set "
+            "ONCE per session — no per-download prompt. Defaults from env var "
+            "MODEL_MANAGER_SCAN_AFTER_DOWNLOAD={ask,always,never}; falls back "
+            "to interactive prompt if unset."
         ),
     )
     ap.add_argument("--search-source", choices=["huggingface", "kaggle", "both"], help="Search source")
