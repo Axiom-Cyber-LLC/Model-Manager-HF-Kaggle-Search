@@ -4173,10 +4173,63 @@ def _clear_active_download(rec_id: str) -> None:
         _save_active_downloads(new)
 
 
+def _migrate_legacy_incoming_staging_paths(records: list[dict]) -> tuple[list[dict], int]:
+    """Rewrite `staging_path` entries that point at the legacy
+    `<DEFAULT_DOWNLOAD_DIR>/.incoming/...` location (when that's no longer
+    the configured incoming dir). Why: the default `INCOMING_DOWNLOAD_DIR`
+    used to be `<DEFAULT_DOWNLOAD_DIR>/.incoming`; it was moved to a
+    sibling path to avoid blowing past LM Studio's 7,000-file scanner cap.
+    A user who `mv`'d the directory will have queue records pointing at
+    the old path — those records would otherwise be silently pruned as
+    "stale" even though the partial bytes are still on disk under the
+    new path. Returns (possibly-rewritten records, count of rewrites).
+
+    Skipped if:
+      - MODEL_MANAGER_INCOMING_DIR is set (user has explicit non-default config)
+      - INCOMING_DOWNLOAD_DIR is the legacy default (no migration needed)
+    """
+    if os.environ.get("MODEL_MANAGER_INCOMING_DIR"):
+        return records, 0
+    legacy_prefix = (DEFAULT_DOWNLOAD_DIR / ".incoming").resolve()
+    new_prefix = INCOMING_DOWNLOAD_DIR
+    if legacy_prefix == new_prefix:
+        return records, 0
+    rewrites = 0
+    out: list[dict] = []
+    for rec in records:
+        staging = rec.get("staging_path", "")
+        if not staging:
+            out.append(rec)
+            continue
+        try:
+            sp = Path(staging)
+            # Match only paths actually under the legacy default; don't touch
+            # custom paths the user might have set per-download.
+            if sp.is_relative_to(legacy_prefix):
+                tail = sp.relative_to(legacy_prefix)
+                candidate = new_prefix / tail
+                if candidate.exists() and not sp.exists():
+                    rec = {**rec, "staging_path": str(candidate)}
+                    rewrites += 1
+        except (ValueError, OSError):
+            pass
+        out.append(rec)
+    return out, rewrites
+
+
 def _prune_stale_active_downloads() -> list[dict]:
     """Drop records whose staging_path no longer exists. Return the remaining
-    records (the still-resumable ones)."""
+    records (the still-resumable ones). Runs the legacy-incoming migration
+    first so records that point at the pre-move `.incoming/` path get
+    rewritten to the new sibling location before the existence check."""
     records = _load_active_downloads()
+    records, rewrites = _migrate_legacy_incoming_staging_paths(records)
+    if rewrites:
+        print(
+            f"Resume queue: migrated {rewrites} record(s) from legacy "
+            f"`{DEFAULT_DOWNLOAD_DIR / '.incoming'}` to `{INCOMING_DOWNLOAD_DIR}`."
+        )
+        _save_active_downloads(records)
     alive: list[dict] = []
     for rec in records:
         staging = rec.get("staging_path", "")

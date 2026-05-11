@@ -8,7 +8,80 @@ The active script is `model_manager.py`. It downloads models to disk first, then
 
 This public repository was rebuilt from a sanitized export. Do not commit local model caches, scan results, chat exports, binary model files, scanner checkouts, virtual environments, archives, spreadsheets, or machine-specific paths.
 
+## Resuming interrupted downloads
+
+`model_manager.py` keeps a persistent in-flight queue at `~/.cache/model_manager/active_downloads.json` so a crashed or restarted session can pick up where it left off. There is no separate command — it runs automatically.
+
+**How to trigger it:** just start the search flow.
+
+```sh
+modelmgr            # menu choice "search/download"
+# or:
+modelmgr --search
+```
+
+The first thing the flow does (after the LM Studio `.incoming/` warning and the security-scan preference prompt) is offer to resume anything in the queue:
+
+```
+──────────────────────────────────────────────────────────────────────────────
+Found 2 unfinished download(s) from a previous session:
+  1. someowner/some-dataset      [dataset, via snapshot_download, started 14:21]  (12.3 GB on disk)
+  2. otherowner/other-model-gguf [model,   via hfdownloader,       started 16:05]  (3.2 GB on disk)
+
+Resume options:
+  y    resume all
+  N    skip (default — records remain for next time)
+  q    forget all (delete records, partials stay on disk)
+  1,3  resume just those by number
+Choice [N]:
+```
+
+- `y` → resume everything in the queue
+- `N` (or just Enter) → skip this time; records stay for the next launch
+- `q` → forget all records (partial files on disk are NOT deleted)
+- `1` or `1,3` → resume only those numbers
+
+Resumes go through the same code path as a fresh download (`download_hf_result` / `download_kaggle_result`), so the existing partial-dir resume in `hfdownloader` and `snapshot_download` handles the byte-level continuation. Already-downloaded shards are not re-fetched.
+
+**If nothing prints when you expect a resume offer:**
+
+1. The queue is empty. Inspect it:
+   ```sh
+   cat ~/.cache/model_manager/active_downloads.json | python3 -m json.tool
+   ```
+
+2. The staging directory the record points at has been deleted/moved. Stale records are pruned silently. As of the 2026-05-10 changes, records pointing at the legacy `<download_root>/.incoming/` path are automatically rewritten to the new sibling default (`<download_root_parent>/.cache/model_manager_incoming/`) at startup — but only if `MODEL_MANAGER_INCOMING_DIR` is unset and the new path actually contains the partial bytes. Custom `MODEL_MANAGER_INCOMING_DIR` is left alone.
+
+3. The download failed before the record was written. The record is added right *before* the download starts, so an immediate-startup failure can leave the queue empty.
+
+**Manual override / debugging:**
+
+```sh
+# View the queue
+cat ~/.cache/model_manager/active_downloads.json | python3 -m json.tool
+
+# Wipe the queue (does not touch partial files)
+rm ~/.cache/model_manager/active_downloads.json
+```
+
+**Related env knobs:**
+
+| Env var | Effect |
+|---|---|
+| `MODEL_MANAGER_INCOMING_DIR=<path>` | Override the in-flight staging directory. Defaults to `<DEFAULT_DOWNLOAD_DIR>.parent/.cache/model_manager_incoming/` — kept *outside* the download root so LM Studio's downloadsFolder scanner doesn't trip its 7,000-file cap. |
+| `MODEL_MANAGER_DOWNLOAD_DIR=<path>` | Where finished downloads land. Defaults to the original SSD path. |
+| `MODEL_MANAGER_SUPPRESS_INCOMING_WARNING=1` | Hide the startup banner about a legacy `.incoming/` still inside the download root. |
+
 ## Recent changes
+
+### 2026-05-10 (later still — resume-queue staging-path migration + docs)
+
+**`model_manager.py`**
+- Resume queue (`~/.cache/model_manager/active_downloads.json`) now auto-migrates records whose `staging_path` points at the legacy `<DEFAULT_DOWNLOAD_DIR>/.incoming/...` path. The new `_migrate_legacy_incoming_staging_paths()` runs inside `_prune_stale_active_downloads()` (called on every `modelmgr` startup) and rewrites a record's `staging_path` when (a) the old path no longer exists, (b) the equivalent path under the new sibling default `INCOMING_DOWNLOAD_DIR` does exist, and (c) the user hasn't set `MODEL_MANAGER_INCOMING_DIR` explicitly. Print summary: `Resume queue: migrated N record(s) from legacy <old> to <new>.` Without this, users who `mv`'d their `.incoming/` per the prior cleanup banner would lose every queued resume — records would point at the now-empty old path and be silently pruned as "stale" even though the partial bytes were still on disk under the new location.
+- Smoke-tested with four record shapes (rewrite-eligible, neither-exists, both-exist, unrelated-path) — only the rewrite-eligible record is updated.
+
+**`README.md`**
+- New top-level section **Resuming interrupted downloads** that documents how the resume queue works, when the auto-prompt fires, how to inspect/clear the queue manually, and the related env vars. Previously the feature was only mentioned in changelog entries.
 
 ### 2026-05-10 (later — scanner UX, incoming-dir relocation)
 
