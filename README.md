@@ -74,6 +74,44 @@ rm ~/.cache/model_manager/active_downloads.json
 
 ## Recent changes
 
+### 2026-05-10 (later still — direct repo-ID lookup in the search bar)
+
+**`model_manager.py`**
+
+A search query that contained a literal `owner/repo` form (e.g.  `meta-llama/Llama-Prompt-Guard-2-86M, meta-llama/Llama-Prompt-Guard-2-22M`) used to return zero results because:
+
+1. The script passed each comma-separated term to HF's `list_models(search=...)`, which does substring matching against names and **does not index the slash**. `meta-llama/Llama-Prompt-Guard-2-86M` never matched anything.
+2. The artifact filter (default GGUF + Core ML) then dropped the model regardless because Prompt-Guard is a BERT-style safetensors classifier.
+
+Now `run_search_flow` partitions the comma-split query into two buckets right after `split_boolean_query()`:
+
+- **Direct repo IDs** — anything matching `parse_hf_repo_id()` (plain `owner/repo` or a `huggingface.co/...` URL) is fetched via `build_exact_hf_result()`, bypassing the name-search entirely. Each result is marked `direct_lookup=True` and is exempt from the artifact-type, size-range, and multipart filters (the user asked for THIS repo by name — don't silently drop it because it lacks a `.gguf`).
+- **Search terms** — everything else continues through the existing search pipeline.
+
+If the user typed only direct repo IDs, the script skips `collect_search_results()` entirely (no provider round-trips at all). If mixed, direct lookups are prepended to the raw results so `merge_search_results()` keeps them as the primary record when a name-search hit duplicates them. New `direct_lookup` flag on `SearchResult`; sticky during merge.
+
+Status messages reflect the partition:
+
+```
+# all direct:
+Resolved 3 direct Hugging Face repo ID(s) — fetching exactly these (skipping name-based search):
+  - meta-llama/Llama-Prompt-Guard-2-86M
+  - meta-llama/Llama-Prompt-Guard-2-22M
+  - meta-llama/Prompt-Guard-86M
+  ✓ 3/3 direct repo lookup(s) succeeded.
+
+# mixed:
+Detected 1 direct repo ID(s) + 2 search term(s):
+  Direct (exact fetch): meta-llama/Llama-Prompt-Guard-2-86M
+  Search terms: cybersecurity, malware
+
+# split-only (unchanged):
+Split search into 3 separate searches:
+  - ...
+```
+
+For `--search-kind both` direct lookups try `model` first then fall back to `dataset` so a single repo ID works for either. Deep-scan fallback is suppressed when there are no search terms (it can't help when the input is all direct IDs and one failed).
+
 ### 2026-05-10 (later still — resume-queue staging-path migration + docs)
 
 **`model_manager.py`**

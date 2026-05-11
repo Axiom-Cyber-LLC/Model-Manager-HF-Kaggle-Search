@@ -335,6 +335,12 @@ class SearchResult:
     duplicate_family: str | None = None
     duplicate_group_size: int = 1
     whole_repo_selected: bool = False
+    # True when this result came from an exact repo-ID lookup (e.g. the user
+    # typed "owner/repo" as a search term). When set, artifact-type / size /
+    # multipart filters skip the result — the user asked for THIS repo, so
+    # don't silently drop it because it doesn't have a .gguf or because it's
+    # smaller/larger than the chosen size range.
+    direct_lookup: bool = False
 
 
 @dataclass
@@ -1595,6 +1601,19 @@ def filter_results_by_artifact_types(results: list[SearchResult], selected_types
         if r.kind != "model":
             kept.append(r)
             continue
+        if r.direct_lookup:
+            # User typed this exact repo-id; refresh metadata so artifacts
+            # show up correctly, but don't drop it on artifact-type mismatch.
+            refresh_hf_file_metadata(r)
+            artifacts = discover_artifacts(r)
+            matching = [a for a in artifacts if artifact_matches_selected_type(a, selected_types)]
+            if matching:
+                apply_visible_artifacts(r, matching)
+                r.notes.append("artifact type match: " + ", ".join(sorted({a.artifact_type for a in matching})) + f"; {len(matching)} direct artifact option(s)")
+            else:
+                r.notes.append("direct repo lookup kept despite artifact-type filter mismatch")
+            kept.append(r)
+            continue
         if r.source != "hf":
             r.notes.append("artifact type not confirmed; provider does not expose reliable file metadata")
             kept.append(r)
@@ -1621,6 +1640,13 @@ def filter_results_by_model_size(
     lo, hi = size_range
     if lo is None and hi is None:
         return results
+    # Direct repo-ID lookups bypass the size filter — user asked for this
+    # exact repo, don't drop it because its size is outside the range.
+    direct = [r for r in results if r.direct_lookup]
+    if direct:
+        results = [r for r in results if not r.direct_lookup]
+        for r in direct:
+            r.notes.append("direct repo lookup kept despite size-range filter")
     kept: list[SearchResult] = []
     removed = 0
     for r in results:
@@ -1649,6 +1675,10 @@ def filter_results_by_model_size(
             removed += 1
     if removed:
         print(f"Filtered out {removed} model repo(s) outside size range: {human_size(lo)} - {human_size(hi)}")
+    # Direct lookups were set aside above; re-attach them at the end so they
+    # appear alongside the search-driven results.
+    if direct:
+        kept.extend(direct)
     return kept
 
 
@@ -1662,6 +1692,10 @@ def filter_results_by_multipart_models(
     removed = 0
     for r in results:
         if r.kind != "model":
+            kept.append(r)
+            continue
+        if r.direct_lookup:
+            r.notes.append("direct repo lookup kept despite multipart filter")
             kept.append(r)
             continue
         if r.source != "hf":
@@ -1740,6 +1774,10 @@ def merge_search_results(results: list[SearchResult]) -> list[SearchResult]:
             existing.files = r.files
         if not existing.license and r.license:
             existing.license = r.license
+        # Sticky: once a repo is marked as a direct user lookup, keep that
+        # flag even if a name-search hit duplicates it.
+        if r.direct_lookup:
+            existing.direct_lookup = True
         if r.notes:
             for note in r.notes:
                 if note not in existing.notes:
@@ -5786,14 +5824,63 @@ def run_search_flow(options: argparse.Namespace | None = None) -> None:
             if options is None and prompt_bool("Try another search?", True):
                 continue
             return
-        search_terms = split_boolean_query(query)
-        if len(search_terms) > 1:
+        raw_terms = split_boolean_query(query)
+        # Partition into exact repo-ID lookups vs name-based search terms.
+        # A term matching `owner/repo` shape is treated as a direct HF lookup
+        # (build_exact_hf_result) rather than a substring search — HF's search
+        # endpoint doesn't index the slash, so e.g. `meta-llama/Llama-Prompt-
+        # Guard-2-86M` would otherwise return zero hits even though the repo
+        # exists. Quoted repo IDs work too; split_boolean_query already strips
+        # the quotes.
+        direct_repo_ids: list[str] = []
+        search_terms: list[str] = []
+        for term in raw_terms:
+            parsed = parse_hf_repo_id(term)
+            if parsed and "/" in parsed:
+                direct_repo_ids.append(parsed)
+            else:
+                search_terms.append(term)
+        if direct_repo_ids and search_terms:
+            print(f"Detected {len(direct_repo_ids)} direct repo ID(s) + {len(search_terms)} search term(s):")
+            print("  Direct (exact fetch): " + ", ".join(direct_repo_ids))
+            print("  Search terms: " + ", ".join(search_terms))
+        elif direct_repo_ids:
+            print(f"Resolved {len(direct_repo_ids)} direct Hugging Face repo ID(s) — fetching exactly these (skipping name-based search):")
+            for rid in direct_repo_ids:
+                print(f"  - {rid}")
+        elif len(search_terms) > 1:
             print(f"Split search into {len(search_terms)} separate searches:")
             for term in search_terms:
                 print(f"  - {term}")
         kind = getattr(options, "search_kind", None) if options is not None else None
         if kind not in {"models", "datasets", "both"}:
             kind = prompt_choice("Search for", ["models", "datasets", "both"], "models")
+        # Fetch direct repo IDs eagerly so we can short-circuit later if the
+        # user typed only repo IDs (skip all the search-term expansion and
+        # provider round-tripping).
+        direct_results: list[SearchResult] = []
+        if direct_repo_ids:
+            # For "both", try as model first; if that fails fall back to dataset.
+            direct_kinds_to_try: list[str]
+            if kind == "datasets":
+                direct_kinds_to_try = ["dataset"]
+            elif kind == "models":
+                direct_kinds_to_try = ["model"]
+            else:
+                direct_kinds_to_try = ["model", "dataset"]
+            for rid in direct_repo_ids:
+                fetched: SearchResult | None = None
+                for k in direct_kinds_to_try:
+                    fetched = build_exact_hf_result(rid, kind=k)
+                    if fetched is not None:
+                        break
+                if fetched is None:
+                    print(f"  ✗ direct fetch failed for {rid} (not a valid HF model or dataset)")
+                    continue
+                fetched.direct_lookup = True
+                direct_results.append(fetched)
+            if direct_results:
+                print(f"  ✓ {len(direct_results)}/{len(direct_repo_ids)} direct repo lookup(s) succeeded.")
         selected_artifact_types: set[str] = set()
         model_size_range: tuple[int | None, int | None] = (None, None)
         exclude_multipart_models = False
@@ -5903,7 +5990,17 @@ def run_search_flow(options: argparse.Namespace | None = None) -> None:
             hide_duplicate_families=hide_duplicate_families_pref if hide_duplicate_families_pref is not None else "prompt_after_search",
         )
 
-        raw_results = collect_search_results(provider_search_terms, source, kind, limit)
+        # Run the name-based search only if there are non-direct terms left.
+        # Otherwise (user typed only repo IDs) skip the round-trip entirely.
+        if provider_search_terms:
+            raw_results = collect_search_results(provider_search_terms, source, kind, limit)
+        else:
+            raw_results = []
+        # Direct lookups go FIRST so merge_search_results keeps them as the
+        # primary record (preserving the direct_lookup flag) when a duplicate
+        # also shows up through the name-search.
+        if direct_results:
+            raw_results = list(direct_results) + raw_results
         raw_hit_count = len(raw_results)
         merged_hit_count = len(merge_search_results(raw_results))
         if kind in {"models", "both"} and hide_duplicate_families_pref is None:
@@ -5937,7 +6034,12 @@ def run_search_flow(options: argparse.Namespace | None = None) -> None:
                 summary_parts.append(f"from {raw_hit_count} raw hit(s)")
             print("Search summary: " + "; ".join(summary_parts) + ".")
 
-        if source in {"huggingface", "both"} and kind in {"models", "both"} and len(results) < page_size:
+        # Deep scan is a NAME-based fallback — only meaningful when there are
+        # search terms left. If the user typed only direct repo IDs and a
+        # direct fetch failed (e.g. wrong owner spelling), the deep scan
+        # won't help — skip it. Otherwise re-fetch into raw_results AND
+        # re-prepend direct lookups so they survive the deep-scan path too.
+        if source in {"huggingface", "both"} and kind in {"models", "both"} and len(results) < page_size and provider_search_terms:
             deep_limit = deep_hf_candidate_limit(limit)
             if deep_limit > limit:
                 print()
@@ -5956,6 +6058,8 @@ def run_search_flow(options: argparse.Namespace | None = None) -> None:
                     pre_excluded_terms=excluded_terms,
                     pre_excluded_family_terms=excluded_family_terms,
                 )
+                if direct_results:
+                    raw_results = list(direct_results) + raw_results
                 raw_hit_count = len(raw_results)
                 merged_hit_count = len(merge_search_results(raw_results))
                 results = filter_and_rank_search_results(
