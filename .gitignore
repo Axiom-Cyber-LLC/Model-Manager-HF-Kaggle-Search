@@ -46,3 +46,19 @@ dist/
 *.joblib
 *.bin
 export_manifest.json
+
+# AI assistant config (proprietary lockdown)
+.claude/
+.cursor/
+.aider*
+.continue/
+.copilot/
+.tabnine/
+.junie/
+.qodo/
+.proxyai/
+.ai/
+.zencoder/
+.minion/
+.ash/
+.mcpower/
