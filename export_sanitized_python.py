@@ -27,13 +27,20 @@ Supported usage:
 Original files are never modified.
 """
 
+# Defer annotation evaluation so PEP 604 union syntax (X | Y) used in
+# function signatures works even when this script is run with the macOS
+# system Python 3.9. The type alias `Replacement` below uses typing.Union
+# explicitly because aliases are evaluated at runtime regardless of this
+# future import.
+from __future__ import annotations
+
 import argparse
 import json
 import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Tuple, Union
 
 
 DEFAULT_PLACEHOLDER = "<Your Model Directory>"
@@ -69,7 +76,10 @@ SKIP_DIR_NAMES = {
     "sanitized_export",
 }
 
-Replacement = tuple[re.Pattern, str | Callable[[re.Match], str]]
+# PEP 604 union syntax (X | Y) at module scope requires Python 3.10+;
+# /usr/bin/python3 on macOS is still 3.9 in some setups. Use typing.Union
+# / typing.Tuple so the sanitizer runs on either interpreter.
+Replacement = Tuple[re.Pattern, Union[str, Callable[[re.Match], str]]]
 
 
 def redact_secret_assignment(match: re.Match) -> str:

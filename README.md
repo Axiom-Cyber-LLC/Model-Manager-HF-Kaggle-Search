@@ -74,6 +74,25 @@ rm ~/.cache/model_manager/active_downloads.json
 
 ## Recent changes
 
+### 2026-05-11 (later — conversion triage + sanitizer 3.9 compat)
+
+**`model_conversion.py`**
+
+Three pain-points around `Step 2/4 — discovering safetensors candidates…` that produced 18-FAIL runs:
+
+1. **Inode dedup.** Discovery used to dedupe by resolved directory path. When the same physical model bytes appeared under two different display directories — typical when LM Studio's hub layout and a flat install layout hardlink to the same `.safetensors` files — the model showed up twice. Now dedupes by `(st_dev, st_ino)` of the largest safetensors file in each candidate. Prints `Deduped N candidate(s) that hardlink to the same bytes.` Separate copies (different inodes) still appear as separate entries.
+
+2. **Architecture pre-filter.** Each candidate's `config.json` is read once to classify it as one of: `ok` (generative LLM), `mlx-quant` (MLX-quantized weights — convert_hf_to_gguf needs the FP16 source), `classifier` (has a task head like `ForSequenceClassification` — produces an unusable GGUF), `sentence-transformer` (encoder-only embedding model — needs special outtype/arch support), or `unknown` (couldn't read the config). The discovery table now shows a `compat` column with the classification, and incompatible rows are listed below with their reason. New interactive prompt right after the table:
+   ```
+   Hide the N likely-incompatible candidate(s) from the selection menu? [Y/n] >
+   ```
+   Skip with `--include-incompatible`. Result: picking "0 = Convert them all" no longer dumps 14 guaranteed FAILs into your terminal.
+
+3. **Quant defaults + alias resolution.** `DEFAULT_QUANT` is now `Q8_0` (was `Q4_K_M`) — the safe default for evaluation quality. Common typos auto-resolve via a new `QUANT_ALIASES` table: `Q8_K_M`→`Q8_0`, `Q4KM`→`Q4_K_M`, `FP16`→`F16`, etc. (`Q8_K_M` was the trigger — there is no K variant for Q8.) If the requested quant is still not in the known list, `difflib.get_close_matches` suggests one (`Did you mean: 'Q8_0'?`) and an interactive confirm gates the passthrough so a typo can't silently waste an hour of `convert_hf_to_gguf` time before `llama-quantize` errors out. New `--allow-unknown-quant` flag bypasses the confirm for legitimate new quant names.
+
+**`export_sanitized_python.py`**
+- Fixed a Python 3.9 compatibility crash: `Replacement = tuple[re.Pattern, str | Callable[...]]` and function annotations using PEP 604 unions (`-> str | None:`) failed under macOS's bundled `/usr/bin/python3 3.9.6`. Added `from __future__ import annotations` and rewrote the type alias with `typing.Union`/`typing.Tuple` so the sanitizer runs on either 3.9 or 3.10+.
+
 ### 2026-05-11 (resume queue survives drive disconnects)
 
 **`model_manager.py`**

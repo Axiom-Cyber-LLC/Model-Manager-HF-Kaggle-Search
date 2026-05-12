@@ -24,6 +24,8 @@ Usage:
 """
 from __future__ import annotations
 import argparse
+import difflib
+import json
 import os
 import re
 import shutil
@@ -34,11 +36,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
-# model_audit lives next to this script in the public tool checkout; the
-# ModelStorage path is only a user-configurable fallback.
+# model_audit lives next to this script's intended home; until everything is in
+# one tree, fall back to the SamsungSSDE copy.
 _AUDIT_PATHS = [
+    Path("<Your Model Directory>"),
     Path(__file__).resolve().parent,
-    Path("/Volumes/ModelStorage/models-flat"),
 ]
 for _p in _AUDIT_PATHS:
     if (_p / "model_audit.py").is_file() and str(_p) not in sys.path:
@@ -56,21 +58,30 @@ except ImportError as e:
 
 HOME = Path.home()
 DEFAULT_SCAN_ROOTS = [
-    Path("/Volumes/ModelStorage/models"),
-    Path("/Volumes/ModelStorage/models-flat"),
-    Path("/Volumes/ModelStorage/.cache/huggingface"),
+    Path("<Your Model Directory>"),
+    Path("<Your Model Directory>"),
+    Path("<REDACTED_PATH>"),
     HOME / ".cache" / "huggingface",
-    Path("/Volumes/ModelStorage/.cache/modelscope"),
+    Path("<Your Model Directory>"),
 ]
-DEFAULT_QUANT = "Q4_K_M"
+DEFAULT_QUANT = "Q8_0"  # was Q4_K_M; Q8_0 is the safe default for LLM eval quality.
 DEFAULT_OUT_DTYPE = "f16"  # convert_hf_to_gguf.py outtype before quantizing
-DEFAULT_ORCHESTRATOR = Path(__file__).resolve().with_name("Prepare_models_for_All.py")
 SUPPORTED_QUANTS = (
     "F32", "F16", "BF16",
     "Q8_0", "Q6_K", "Q5_K_M", "Q5_K_S", "Q4_K_M", "Q4_K_S",
     "Q3_K_L", "Q3_K_M", "Q3_K_S", "Q2_K",
     "IQ4_XS", "IQ3_M", "IQ3_S", "IQ2_M", "IQ2_S",
 )
+# Common typos and aliases mapped to the correct llama-quantize name.
+QUANT_ALIASES = {
+    "Q8_K_M": "Q8_0",     # No K variant for Q8; user likely meant Q8_0.
+    "Q8_K": "Q8_0",
+    "Q4KM": "Q4_K_M",
+    "Q5KM": "Q5_K_M",
+    "Q6KM": "Q6_K",
+    "FP16": "F16",
+    "FP32": "F32",
+}
 
 CONVERT_BIN = "/opt/homebrew/bin/convert_hf_to_gguf.py"
 QUANTIZE_BIN = "/opt/homebrew/bin/llama-quantize"
@@ -90,6 +101,98 @@ class Candidate:
     n_safetensors: int
     has_existing_gguf: bool
     existing_gguf_quants: list[str]
+    # NEW (2026-05-11): compatibility classification + inode dedup
+    # compat: "ok" | "mlx-quant" | "classifier" | "sentence-transformer" | "unknown"
+    compat: str = "ok"
+    compat_reason: str = ""
+    # (st_dev, st_ino) of the largest *.safetensors file in `path`. Used to
+    # dedupe candidates that point at the same physical bytes via different
+    # display directories (e.g., LM Studio hub layout + flat layout sharing
+    # hardlinks). None when the candidate has no safetensors files we can stat.
+    primary_inode: tuple[int, int] | None = None
+
+
+# ── Compatibility detection ──────────────────────────────────────────
+
+
+# model_type values that produce embeddings/classifiers, not generative LLMs.
+_ENCODER_TYPES = {
+    "bert", "roberta", "distilbert", "albert", "electra", "xlm-roberta",
+    "mpnet", "deberta", "deberta-v2", "deberta-v3", "convbert",
+    "longformer", "reformer", "big_bird",
+}
+
+# `architectures` substrings that mean "this has a non-LLM task head" —
+# convert_hf_to_gguf either can't handle them or produces a useless GGUF.
+_CLASSIFIER_ARCH_TOKENS = (
+    "forsequenceclassification",
+    "fortokenclassification",
+    "formultiplechoice",
+    "forquestionanswering",
+    "formaskedlm",
+)
+
+
+def _detect_compat(d: Path) -> tuple[str, str]:
+    """Classify whether `d` will produce a usable LLM GGUF.
+
+    Returns (compat, reason). compat is one of:
+      ok                   — generative LLM that convert_hf_to_gguf supports
+      mlx-quant            — MLX-quantized; convert_hf_to_gguf needs FP16 source
+      classifier           — has a task head (BERT-for-classification, etc.)
+      sentence-transformer — embedding model; needs special outtype/arch support
+      unknown              — couldn't read config.json or no model_type clue
+    """
+    cfg_path = d / "config.json"
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "unknown", "could not read config.json"
+
+    # MLX-quantized models leave a quantization block with bits/group_size.
+    quant_cfg = cfg.get("quantization")
+    if isinstance(quant_cfg, dict) and ("bits" in quant_cfg or "group_size" in quant_cfg):
+        return "mlx-quant", f"MLX quantized ({quant_cfg.get('bits', '?')}-bit)"
+
+    # Sentence-transformers checkpoints carry their own config siblings.
+    if (d / "config_sentence_transformers.json").is_file() or \
+       (d / "sentence_bert_config.json").is_file():
+        return "sentence-transformer", "sentence-transformers config present"
+
+    archs_raw = cfg.get("architectures") or []
+    archs_lower = [str(a).lower() for a in archs_raw]
+    for arch in archs_lower:
+        for tok in _CLASSIFIER_ARCH_TOKENS:
+            if tok in arch:
+                return "classifier", f"task head: {arch}"
+
+    model_type = str(cfg.get("model_type") or "").lower()
+    if model_type in _ENCODER_TYPES:
+        # No classifier head detected above, but encoder architectures
+        # without a generative head are usually sentence-transformers.
+        return "sentence-transformer", f"{model_type} encoder model"
+
+    return "ok", ""
+
+
+def _primary_safetensors_inode(safetensors: list[Path]) -> tuple[int, int] | None:
+    """Return (st_dev, st_ino) of the largest safetensors file, for dedup."""
+    if not safetensors:
+        return None
+    candidates: list[tuple[int, Path]] = []
+    for p in safetensors:
+        try:
+            candidates.append((p.stat().st_size, p))
+        except OSError:
+            continue
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    try:
+        s = candidates[0][1].stat()
+        return (s.st_dev, s.st_ino)
+    except OSError:
+        return None
 
 
 def _human(n: int) -> str:
@@ -143,8 +246,14 @@ def _has_blocking_format(d: Path) -> bool:
 
 
 def discover_candidates(roots: list[Path]) -> list[Candidate]:
-    seen: set[Path] = set()
+    seen_paths: set[Path] = set()
+    # Dedup by canonical inode of the largest safetensors file. Hardlinked
+    # mirrors (e.g., LM Studio hub layout + flat install layout pointing at
+    # the same bytes) previously appeared as separate entries because the
+    # directory paths differed even though the model bytes were identical.
+    seen_inodes: set[tuple[int, int]] = set()
     out: list[Candidate] = []
+    duplicates_skipped = 0
     for root in roots:
         if not root.is_dir():
             continue
@@ -164,9 +273,9 @@ def discover_candidates(roots: list[Path]) -> list[Candidate]:
                 real = d.resolve()
             except OSError:
                 real = d
-            if real in seen:
+            if real in seen_paths:
                 continue
-            seen.add(real)
+            seen_paths.add(real)
             if not _looks_like_safetensors_dir(d):
                 continue
             if not _has_blocking_format(d):
@@ -178,6 +287,13 @@ def discover_candidates(roots: list[Path]) -> list[Candidate]:
                 total_st = sum(f.stat().st_size for f in safetensors)
             except OSError:
                 continue
+            primary_inode = _primary_safetensors_inode(safetensors)
+            if primary_inode is not None and primary_inode in seen_inodes:
+                duplicates_skipped += 1
+                continue
+            if primary_inode is not None:
+                seen_inodes.add(primary_inode)
+            compat, compat_reason = _detect_compat(d)
             publisher, model = _publisher_model(d)
             out.append(Candidate(
                 path=d,
@@ -187,25 +303,82 @@ def discover_candidates(roots: list[Path]) -> list[Candidate]:
                 n_safetensors=len(safetensors),
                 has_existing_gguf=bool(existing_ggufs),
                 existing_gguf_quants=sorted({_detect_quant(g.name) for g in existing_ggufs}),
+                compat=compat,
+                compat_reason=compat_reason,
+                primary_inode=primary_inode,
             ))
-    out.sort(key=lambda c: (c.has_existing_gguf, c.publisher.lower(), c.model.lower()))
+    if duplicates_skipped:
+        print(f"  Deduped {duplicates_skipped} candidate(s) that hardlink to the same bytes.")
+    # Sort: compatible first, then existing-gguf last, then alphabetical.
+    out.sort(key=lambda c: (
+        c.compat != "ok",          # ok first
+        c.has_existing_gguf,        # not-yet-converted first
+        c.publisher.lower(),
+        c.model.lower(),
+    ))
     return out
+
+
+_COMPAT_TAG = {
+    "ok": "ok",
+    "mlx-quant": "MLX",
+    "classifier": "CLS",
+    "sentence-transformer": "ST",
+    "unknown": "?",
+}
 
 
 def print_table(cands: list[Candidate]) -> None:
     print()
-    print(f"{'#':>3}  {'publisher/model':<55}  {'size':>10}  shards  existing")
-    print("-" * 100)
+    print(f"{'#':>3}  {'publisher/model':<55}  {'size':>10}  shards  {'compat':<5}  existing")
+    print("-" * 110)
     for i, c in enumerate(cands, 1):
         existing = ",".join(c.existing_gguf_quants) if c.has_existing_gguf else "—"
         name = f"{c.publisher}/{c.model}"
         if len(name) > 55:
             name = name[:52] + "..."
+        tag = _COMPAT_TAG.get(c.compat, "?")
         print(f"{i:>3}  {name:<55}  {_human(c.total_safetensors_bytes):>10}  "
-              f"{c.n_safetensors:>5}  {existing}")
+              f"{c.n_safetensors:>5}  {tag:<5}  {existing}")
+    # Footnote any incompatibles so the user can decide whether to skip them.
+    incompat = [c for c in cands if c.compat != "ok"]
+    if incompat:
+        print()
+        print("Compat key:  ok = generative LLM (will convert)")
+        print("             MLX = MLX-quantized weights; convert_hf_to_gguf needs FP16 source — will fail")
+        print("             CLS = task head (classifier/QA); produces unusable GGUF — will fail")
+        print("             ST  = sentence-transformer / encoder-only; embedding GGUF only if supported")
+        print("             ?   = couldn't read config.json")
+        print()
+        print(f"  {len(incompat)} of {len(cands)} candidates flagged as likely-incompatible:")
+        for c in incompat:
+            print(f"    [{_COMPAT_TAG[c.compat]:<3}] {c.publisher}/{c.model} — {c.compat_reason}")
     print()
     print("  0  Convert them all")
     print()
+
+
+def filter_incompatible_interactive(cands: list[Candidate]) -> list[Candidate]:
+    """If any candidates are flagged incompatible, ask whether to drop them
+    from the selection menu. Returns the (possibly trimmed) candidate list.
+    Non-interactive callers (no TTY) skip the prompt and keep all candidates."""
+    incompat = [c for c in cands if c.compat != "ok"]
+    if not incompat:
+        return cands
+    if not sys.stdin.isatty():
+        return cands
+    try:
+        ans = input(
+            f"Hide the {len(incompat)} likely-incompatible candidate(s) from "
+            f"the selection menu? [Y/n] > "
+        ).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return cands
+    if ans in ("", "y", "yes"):
+        kept = [c for c in cands if c.compat == "ok"]
+        print(f"  Hidden {len(cands) - len(kept)}; {len(kept)} candidate(s) remain.")
+        return kept
+    return cands
 
 
 # ── Selection parsing ────────────────────────────────────────────────
@@ -373,8 +546,15 @@ def main() -> int:
                     help="Run the post-conversion prepare-all/register step without prompting")
     ap.add_argument("--force", action="store_true",
                     help="Re-convert even if a sibling .gguf at the target quant exists")
+    ap.add_argument("--allow-unknown-quant", action="store_true",
+                    help="Skip the interactive confirm when --quant is not in the known list "
+                         "(useful for new llama-quantize options).")
+    ap.add_argument("--include-incompatible", action="store_true",
+                    help="Don't auto-hide candidates flagged as MLX-quantized, classifier, "
+                         "sentence-transformer, or unknown architecture. Default behavior is "
+                         "to ask interactively; this flag forces 'include all'.")
     ap.add_argument("--orchestrator",
-                    default=str(DEFAULT_ORCHESTRATOR),
+                    default="<Your Model Directory>/Prepare_models_for_All.py",
                     help="Path to orchestrator (used by the post-conversion register prompt)")
     args = ap.parse_args()
 
@@ -406,6 +586,16 @@ def main() -> int:
 
     if args.list_only:
         return 0
+
+    # Offer to hide candidates flagged as likely-incompatible (MLX-quantized,
+    # classifier heads, sentence-transformers, unknown arch). This is the
+    # most common cause of "I picked 18, got 18 FAILs" complaints. Skip the
+    # prompt with --include-incompatible.
+    if not args.include_incompatible:
+        cands = filter_incompatible_interactive(cands)
+        if not cands:
+            print("All candidates were filtered out; nothing to convert.")
+            return 0
 
     # 3) Tool sanity check
     ok, msg = _check_tools()
@@ -455,11 +645,39 @@ def main() -> int:
 
     # 5) Convert
     print("\nStep 4/4 — converting…")
-    quants = [q.strip().upper() for q in args.quant.split(",")]
-    for q in quants:
+    quants_raw = [q.strip().upper() for q in args.quant.split(",")]
+    quants: list[str] = []
+    for q in quants_raw:
+        # Auto-resolve common typos / aliases so a Q8_K_M doesn't reach
+        # llama-quantize and blow up after a long convert step.
+        if q in QUANT_ALIASES:
+            mapped = QUANT_ALIASES[q]
+            print(f"  quant alias: {q!r} → {mapped!r}")
+            q = mapped
         if q not in SUPPORTED_QUANTS:
-            print(f"WARNING: quant {q!r} not in known list ({', '.join(SUPPORTED_QUANTS)}); "
-                  "passing through to llama-quantize anyway.")
+            # Offer a "did you mean" guess from the known list.
+            guess = difflib.get_close_matches(q, SUPPORTED_QUANTS, n=1, cutoff=0.4)
+            hint = f"  Did you mean: {guess[0]!r}?" if guess else ""
+            print(f"WARNING: quant {q!r} is not in the known list.")
+            if hint:
+                print(hint)
+            print(f"  Known: {', '.join(SUPPORTED_QUANTS)}")
+            if sys.stdin.isatty() and not args.allow_unknown_quant:
+                try:
+                    ans = input(
+                        f"  Pass {q!r} through to llama-quantize anyway? [y/N] > "
+                    ).strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    ans = ""
+                if ans not in ("y", "yes"):
+                    print(f"  Skipping unknown quant {q!r}.")
+                    continue
+            else:
+                print(f"  Passing {q!r} through (--allow-unknown-quant or non-TTY).")
+        quants.append(q)
+    if not quants:
+        print("  No valid quants to run; aborting.")
+        return 0
     produced: list[Path] = []
     for q in quants:
         produced.extend(run_conversions(chosen, q, args.workers, args.dry_run))
