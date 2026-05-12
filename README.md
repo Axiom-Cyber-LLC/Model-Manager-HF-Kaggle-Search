@@ -74,6 +74,30 @@ rm ~/.cache/model_manager/active_downloads.json
 
 ## Recent changes
 
+### 2026-05-11 (resume queue survives drive disconnects)
+
+**`model_manager.py`**
+
+`_prune_stale_active_downloads()` previously dropped any record whose `staging_path` failed `Path.exists()`. That worked for "user deleted the partials," but it also silently destroyed records whose staging directory lived on an external drive that was momentarily unplugged — e.g. a USB-C dongle wiggle, a yanked Thunderbolt cable, or a sleep/wake cycle that left a phantom mount point in `/Volumes/`. After the prune fired, the bytes on the drive (which could be tens of GB of partial download) were orphaned: not in the queue anymore, not findable through the resume prompt, and the next `modelmgr` invocation would offer to start a fresh download from byte zero.
+
+New helper `_staging_path_volume_unmounted(staging)` checks whether `staging` lives under `/Volumes/<name>/...` and whether `/Volumes/<name>` is currently a mount point (`os.path.ismount`). When the volume isn't mounted, the prune step keeps the record instead of dropping it, and prints:
+
+```
+Resume queue: keeping 1 record(s) whose staging dir lives on a currently-unmounted volume:
+  /Volumes/SamsungSSDE. Reconnect the drive and re-run `modelmgr` to resume.
+```
+
+Behavior summary, by record state:
+
+| Volume status | Staging path exists | Action |
+|---|---|---|
+| Mounted | yes | keep (resumable) |
+| Mounted | no | prune (genuinely missing) |
+| Unmounted (`/Volumes/<name>` not a mount point) | no (can't check) | **keep** (NEW) |
+| Boot-drive path | no | prune |
+
+Heuristic is macOS-specific (`/Volumes/<name>`); the script targets macOS. Smoke-tested against four record shapes (mounted-existing, mounted-missing, phantom-volume, boot-drive-missing) — only the rewrite-eligible records survive, the new "phantom volume" case being the only behavior change vs the previous version.
+
 ### 2026-05-10 (later still — direct repo-ID lookup in the search bar)
 
 **`model_manager.py`**

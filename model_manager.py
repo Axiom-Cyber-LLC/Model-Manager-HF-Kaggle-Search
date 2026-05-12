@@ -4211,6 +4211,36 @@ def _clear_active_download(rec_id: str) -> None:
         _save_active_downloads(new)
 
 
+def _staging_path_volume_unmounted(staging: Path) -> bool:
+    """Return True when `staging` lives under `/Volumes/<name>/...` and that
+    mount point is NOT currently mounted. Used by `_prune_stale_active_downloads`
+    so we don't drop in-flight resume records while the drive happens to be
+    unplugged at the moment we check. Plug the drive back in and the record
+    is still resumable.
+
+    Heuristic is macOS-specific (the script is macOS-targeted): any path with
+    `/Volumes/<name>` as its first two segments where `os.path.ismount(<name>)`
+    is False → considered unmounted. Returns False for boot-drive paths and
+    for any failure to evaluate.
+    """
+    try:
+        sp = Path(staging).resolve(strict=False)
+    except (OSError, ValueError):
+        return False
+    parts = sp.parts
+    # Must be /Volumes/<name>/... — fewer than 3 parts means we're at /Volumes
+    # or above, which is never a per-drive mount point we care about here.
+    if len(parts) < 3 or parts[0] != "/" or parts[1] != "Volumes":
+        return False
+    mount_point = Path("/") / parts[1] / parts[2]
+    try:
+        return not os.path.ismount(str(mount_point))
+    except OSError:
+        # Can't evaluate; err on the safe side and assume mounted (so prune
+        # behavior is unchanged from before this function existed).
+        return False
+
+
 def _migrate_legacy_incoming_staging_paths(records: list[dict]) -> tuple[list[dict], int]:
     """Rewrite `staging_path` entries that point at the legacy
     `<DEFAULT_DOWNLOAD_DIR>/.incoming/...` location (when that's no longer
@@ -4259,7 +4289,13 @@ def _prune_stale_active_downloads() -> list[dict]:
     """Drop records whose staging_path no longer exists. Return the remaining
     records (the still-resumable ones). Runs the legacy-incoming migration
     first so records that point at the pre-move `.incoming/` path get
-    rewritten to the new sibling location before the existence check."""
+    rewritten to the new sibling location before the existence check.
+
+    Records whose staging_path lives on a currently-unmounted external
+    volume are KEPT (not pruned) so a brief drive disconnect can't lose
+    your in-flight downloads. Reconnect the drive and they're resumable
+    on the next `modelmgr` run.
+    """
     records = _load_active_downloads()
     records, rewrites = _migrate_legacy_incoming_staging_paths(records)
     if rewrites:
@@ -4269,10 +4305,30 @@ def _prune_stale_active_downloads() -> list[dict]:
         )
         _save_active_downloads(records)
     alive: list[dict] = []
+    unmounted_kept: list[str] = []
     for rec in records:
         staging = rec.get("staging_path", "")
-        if staging and Path(staging).exists():
+        if not staging:
+            continue
+        sp = Path(staging)
+        if sp.exists():
             alive.append(rec)
+            continue
+        if _staging_path_volume_unmounted(sp):
+            alive.append(rec)
+            try:
+                unmounted_kept.append(str(Path("/") / sp.parts[1] / sp.parts[2]))
+            except IndexError:
+                pass
+            continue
+        # Genuinely missing on a mounted volume — prune.
+    if unmounted_kept:
+        unique_volumes = sorted(set(unmounted_kept))
+        print(
+            f"Resume queue: keeping {len(unmounted_kept)} record(s) whose staging dir "
+            f"lives on a currently-unmounted volume: {', '.join(unique_volumes)}. "
+            f"Reconnect the drive and re-run `modelmgr` to resume."
+        )
     if len(alive) != len(records):
         _save_active_downloads(alive)
     return alive
