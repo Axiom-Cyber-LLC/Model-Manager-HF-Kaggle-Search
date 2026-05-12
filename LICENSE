@@ -1,0 +1,74 @@
+PROPRIETARY SOFTWARE LICENSE
+
+Copyright (c) 2026 Axiom Cyber LLC. All rights reserved.
+
+Model Manager HF/Kaggle Search, including `model_manager.py`, the
+post-download model audit scanners, the `Prepare_models_for_*` adapter
+scripts, GGUF inspection utilities, the reconcile_ollama tooling, the
+agent filesystem wrapper, associated documentation, build scripts, and
+example artifacts (collectively, the "Software"), is the proprietary and
+confidential property of Axiom Cyber LLC ("Licensor").
+
+NO LICENSE OR RIGHTS ARE GRANTED to any person or entity by virtue of
+obtaining a copy of the Software, accessing the Software's source code or
+binaries, or any other means. The Software is NOT open source, NOT free
+software, and NOT available under any standard open-source license.
+
+The following are STRICTLY PROHIBITED without prior written permission from
+the Licensor, signed by an authorized representative:
+
+  1. Use of the Software for any purpose, commercial or non-commercial.
+  2. Copying, reproducing, or making derivative works of the Software, in
+     whole or in part.
+  3. Distributing, sublicensing, selling, leasing, or transferring the
+     Software, its source code, or any derivative work to any third party.
+  4. Reverse engineering, decompiling, or disassembling the Software.
+  5. Removing, altering, or obscuring any proprietary notices in the
+     Software, including this license.
+  6. Disclosing or publishing the Software, its source code, its design,
+     or any non-public technical information about it to any third party.
+  7. Using the Software's name, logos, or trademarks (including
+     "Model Manager HF/Kaggle Search" and "Axiom Cyber") for any purpose
+     without prior written permission.
+
+EMPLOYEE, CONTRACTOR, AND COLLABORATOR ACCESS: Any individual granted
+access to the Software in their capacity as an employee, contractor, or
+collaborator of the Licensor is bound by a separate written agreement and
+must not disclose, copy, or use the Software outside the scope of that
+agreement. Access does not transfer ownership.
+
+NO IMPLIED LICENSE: No license is granted by implication, estoppel, or
+otherwise. All rights not expressly granted in writing are reserved by the
+Licensor.
+
+THIRD-PARTY COMPONENTS: The Software incorporates and interoperates with
+third-party open-source components (e.g., Hugging Face Hub client, Kaggle
+API, third-party model-scan utilities), each governed by its own license.
+The terms of those third-party licenses apply only to those components, not
+to the Software as a whole. The Software's incorporation of or interaction
+with permissively-licensed third-party components does NOT make the Software
+open source. Model files downloaded by the Software remain subject to the
+license terms of their respective publishers (e.g., Hugging Face, Kaggle,
+model authors) and are not part of the Software.
+
+NO WARRANTY: THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+
+LIMITATION OF LIABILITY: IN NO EVENT SHALL THE LICENSOR BE LIABLE FOR ANY
+CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT,
+OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR
+THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+GOVERNING LAW: This license is governed by the laws of the United States
+of America. Any disputes arising under this license shall be resolved in
+the federal or state courts located in the Licensor's jurisdiction of
+principal business operation.
+
+CONTACT: For licensing inquiries, contact the Licensor through:
+  https://github.com/Axiom-Cyber-LLC
+
+---
+
+If you have received the Software in error, you must immediately delete
+all copies in your possession and notify the Licensor.
