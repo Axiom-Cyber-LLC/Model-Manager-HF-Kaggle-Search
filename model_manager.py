@@ -3140,17 +3140,29 @@ def show_artifact_picker_for_repo(result: SearchResult) -> bool:
         first = art.files[0][0] if art.files else art.label
         extra = f" +{len(art.files)-1} files" if len(art.files) > 1 else ""
         print(f"{art.index:>4}  {human_size(art.total_size):>12}  {art.artifact_type:<22}  {quant:<10}  {first}{extra}")
+    # Single prompt for the picker — the previous flow asked for a "mode"
+    # first (artifact_numbers / whole_repo / skip), then re-prompted for
+    # numbers. 95% of the time the user wants numbers; "whole" and "skip"
+    # are rare enough to be inline keywords here.
     print()
-    mode = prompt_choice("Select from this repo", ["artifact_numbers", "whole_repo", "skip"], "artifact_numbers")
-    if mode == "skip":
+    print(f"Pick artifact(s) from repo {result.index}.")
+    print(f"  Numbers: 1 | 1,3 | 2-4 | all")
+    print(f"  Or keyword: `whole` (entire {human_size(result.size_bytes)} repo) | `skip` / Enter (cancel)")
+    raw = prompt("Which artifact(s)?", "skip").strip().lower()
+    if not raw or raw in {"skip", "n", "no", "none", "-"}:
         return False
-    if mode == "whole_repo":
+    if raw in {"whole", "whole_repo", "wholerepo", "all-repo", "everything"}:
         if prompt_bool(f"Whole repo is {human_size(result.size_bytes)}. Select whole repo?", False):
             result.whole_repo_selected = True
             return True
         return False
-    nums = parse_selection(prompt("Which artifact numbers? Examples: 1, 1,3, 2-4, all"), len(artifacts))
+    try:
+        nums = parse_selection(raw, len(artifacts))
+    except ValueError as e:
+        print(f"  Could not parse {raw!r}: {e}. Nothing selected.")
+        return False
     if not nums:
+        print(f"  No valid artifact numbers in {raw!r}. Nothing selected.")
         return False
     for n in nums:
         art = artifacts[n - 1]
