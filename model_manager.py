@@ -711,20 +711,46 @@ def find_hfdownloader_binary() -> Path | None:
 
 
 def hfdownloader_filter_terms_from_artifacts(artifacts: list[Artifact] | None) -> list[str]:
+    """Build the `--filters` value for hfdownloader from selected artifacts.
+
+    hfdownloader's `--filters` flag expects short *quant tag tokens* that
+    appear inside LFS filenames (e.g. `q4_0`, `q5_K_M`, `iq2_xxs`,
+    `bf16`). Its matcher fails to recognize a full filename like
+    `Foo-Bar.i1-Q2_K.gguf` and silently falls back to downloading the
+    whole repo — that's how a 77 GB artifact selection turned into a
+    1 TB pull.
+
+    Strategy:
+      1. If the artifact has a recognized quant tag, use that (preferred).
+      2. Otherwise, fall back to file BASENAME WITHOUT EXTENSION — which
+         in practice still contains the quant tag and matches hfdownloader's
+         filename-substring logic, while avoiding the `.gguf` suffix and
+         path separators that confuse it.
+    Returns deduped, lowercase tokens.
+    """
     if not artifacts:
         return []
     terms: list[str] = []
     seen: set[str] = set()
+
+    def _add(token: str) -> None:
+        tok = token.strip().lower()
+        if tok and tok not in seen:
+            seen.add(tok)
+            terms.append(tok)
+
     for art in artifacts:
+        if art.quant and art.quant != "-":
+            _add(art.quant)
+            continue
         for name, _ in art.files:
             base = Path(name).name.strip()
             if not base:
                 continue
-            lower = base.lower()
-            if lower in seen:
-                continue
-            seen.add(lower)
-            terms.append(base)
+            # Strip the extension so the matcher sees the meaningful tail
+            # (which usually contains the quant code).
+            stem = base.rsplit(".", 1)[0] if "." in base else base
+            _add(stem)
     return terms
 
 
@@ -1454,15 +1480,27 @@ def parse_existing_dirs_value(value: str | None) -> list[Path]:
 
 def prompt_existing_dirs() -> list[Path]:
     """Ask the user once per search for directories whose contents should be
-    excluded from results. Returns [] if the user skips."""
+    excluded from results. Returns [] if the user skips. Default order of
+    precedence:
+      1. MODEL_MANAGER_EXISTING_DIRS env var (explicit user override)
+      2. DEFAULT_DOWNLOAD_DIR (almost everyone wants to exclude things
+         already sitting in their main downloads root)
+    """
     default = os.environ.get("MODEL_MANAGER_EXISTING_DIRS", "").strip()
+    default_source = "env" if default else None
+    if not default and DEFAULT_DOWNLOAD_DIR.exists() and DEFAULT_DOWNLOAD_DIR.is_dir():
+        default = str(DEFAULT_DOWNLOAD_DIR)
+        default_source = "download-root"
     print()
     print("Already-downloaded filter")
     print("  Provide one or more directories — any owner/repo found inside")
     print("  will be hidden from results. Separate with `:` or `,`. Press")
-    print("  Enter to skip. Set MODEL_MANAGER_EXISTING_DIRS to default this.")
-    if default:
+    print("  Enter to accept the default, or type `none` to skip.")
+    print("  Set MODEL_MANAGER_EXISTING_DIRS to override the default.")
+    if default and default_source == "env":
         print(f"  Default (from env): {default}")
+    elif default and default_source == "download-root":
+        print(f"  Default (download root): {default}")
     raw = prompt("Directories with already-downloaded models/datasets", default).strip()
     if not raw or raw.lower() in {"none", "no", "n", "-", "skip"}:
         return []
@@ -4074,6 +4112,42 @@ def download_hf_with_hfdownloader(
     excludes = hfdownloader_exclude_terms_for_artifacts(artifacts)
     if excludes:
         cmd.extend(["--exclude", ",".join(excludes)])
+
+    # Loud safety check: if we selected specific artifacts but ended up with
+    # no `--filters` to constrain hfdownloader, that's the silent-whole-repo
+    # bug we just fixed. Refuse rather than start a TB-scale pull.
+    if artifacts and not filters:
+        print()
+        print("=" * 78)
+        print("ABORT: artifact selection produced no hfdownloader filter terms.")
+        print("=" * 78)
+        for art in artifacts:
+            print(f"  - {art.label}  (quant={art.quant!r}, type={art.artifact_type!r})")
+        print()
+        print("Without `--filters`, hfdownloader would pull the whole repo.")
+        print("This usually means the Artifact lacks a recognizable quant tag.")
+        print("Falling back to the Python downloader, which honors allow_patterns directly.")
+        debug_log(
+            "hfdownloader-filter-empty",
+            repo_id=result.repo_id,
+            artifact_count=len(artifacts),
+            artifact_labels=[a.label for a in artifacts],
+            artifact_quants=[a.quant for a in artifacts],
+        )
+        return None  # caller falls back to snapshot_download with allow_patterns
+
+    debug_log(
+        "hfdownloader-dispatch",
+        repo_id=result.repo_id,
+        kind=result.kind,
+        target=str(target),
+        selected_artifact_labels=[a.label for a in (artifacts or [])],
+        selected_artifact_quants=[a.quant for a in (artifacts or [])],
+        filter_terms=filters,
+        exclude_terms=excludes,
+        allow_patterns=allow_patterns,
+        cmd=cmd,
+    )
 
     endpoint = os.getenv("MODEL_MANAGER_HF_ENDPOINT") or os.getenv("HF_ENDPOINT")
     if endpoint:
