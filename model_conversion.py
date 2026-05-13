@@ -36,10 +36,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
+# ── Module-level constants for repeated string literals ─────────────
+# (Extracted to satisfy SonarCloud python:S1192 maintainability findings.)
+DEFAULT_MODEL_DIR_PLACEHOLDER = "<Your Model Directory>"
+CONFIG_FILENAME = "config.json"
+
 # model_audit lives next to this script's intended home; until everything is in
 # one tree, fall back to the SamsungSSDE copy.
 _AUDIT_PATHS = [
-    Path("<Your Model Directory>"),
+    Path(DEFAULT_MODEL_DIR_PLACEHOLDER),
     Path(__file__).resolve().parent,
 ]
 for _p in _AUDIT_PATHS:
@@ -58,11 +63,11 @@ except ImportError as e:
 
 HOME = Path.home()
 DEFAULT_SCAN_ROOTS = [
-    Path("<Your Model Directory>"),
-    Path("<Your Model Directory>"),
+    Path(DEFAULT_MODEL_DIR_PLACEHOLDER),
+    Path(DEFAULT_MODEL_DIR_PLACEHOLDER),
     Path("<REDACTED_PATH>"),
     HOME / ".cache" / "huggingface",
-    Path("<Your Model Directory>"),
+    Path(DEFAULT_MODEL_DIR_PLACEHOLDER),
 ]
 DEFAULT_QUANT = "Q8_0"  # was Q4_K_M; Q8_0 is the safe default for LLM eval quality.
 DEFAULT_OUT_DTYPE = "f16"  # convert_hf_to_gguf.py outtype before quantizing
@@ -143,7 +148,7 @@ def _detect_compat(d: Path) -> tuple[str, str]:
       sentence-transformer — embedding model; needs special outtype/arch support
       unknown              — couldn't read config.json or no model_type clue
     """
-    cfg_path = d / "config.json"
+    cfg_path = d / CONFIG_FILENAME
     try:
         cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -231,7 +236,7 @@ def _looks_like_safetensors_dir(d: Path) -> bool:
     """An HF-style safetensors directory: config.json + at least one .safetensors."""
     if not d.is_dir():
         return False
-    if not (d / "config.json").is_file():
+    if not (d / CONFIG_FILENAME).is_file():
         return False
     return any(d.glob("*.safetensors"))
 
@@ -258,7 +263,7 @@ def discover_candidates(roots: list[Path]) -> list[Candidate]:
         if not root.is_dir():
             continue
         # Walk subdirs that contain a config.json
-        for cfg in root.rglob("config.json"):
+        for cfg in root.rglob(CONFIG_FILENAME):
             d = cfg.parent
             try:
                 rel = d.relative_to(root).parts
