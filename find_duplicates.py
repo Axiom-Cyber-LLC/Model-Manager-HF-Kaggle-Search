@@ -155,6 +155,160 @@ def blob_size(paths: list[Path]) -> int:
     return 0
 
 
+# ── multi-quant cluster discovery ────────────────────────────────────
+# Catches the "modelmgr/hfdownloader pulled the entire mradermacher kitchen-
+# sink repo and now I have 8-10 quants of the same model" scenario.
+# Different from blob-dup detection: each quant is a DIFFERENT file with a
+# unique sha256, but they all derive from the same base model. Group by base
+# name (with quant suffix stripped) so the user can pick which quant(s) to
+# keep and delete the rest.
+
+# Recognized quant tokens, in approximate quality-descending order. Matched
+# case-insensitively. Ordering is used for the "recommended keep" suggestion.
+_QUANT_TOKENS_ORDERED = [
+    "F32", "F16", "BF16", "FP16", "FP32",
+    "Q8_0", "Q6_K",
+    "Q5_K_M", "Q5_K_S", "Q5_0", "Q5_1",
+    "Q4_K_M", "Q4_K_S", "Q4_0", "Q4_1",
+    "IQ4_XS", "IQ4_NL",
+    "Q3_K_L", "Q3_K_M", "Q3_K_S",
+    "IQ3_M", "IQ3_S", "IQ3_XS", "IQ3_XXS",
+    "Q2_K", "Q2_K_S",
+    "IQ2_M", "IQ2_S", "IQ2_XS", "IQ2_XXS",
+    "IQ1_M", "IQ1_S",
+]
+# Recommended keep — first match in this list wins. Q4_K_M is the standard
+# size/quality sweet spot for general-purpose use; falls back through other
+# common picks if the user only has higher- or lower-precision variants.
+_KEEP_PREFERENCE = ["Q4_K_M", "Q5_K_M", "Q6_K", "Q4_K_S", "Q3_K_M", "Q8_0", "F16"]
+
+_QUANT_RE = re.compile(
+    r"""
+    [._-]                       # separator before quant token (. _ -)
+    (?:i\d+[._-])?              # optional i1- / i2- prefix (mradermacher imatrix series)
+    (
+        I?Q\d+(?:_[A-Z0-9]+)*   # Q-series: Q2_K, Q4_K_M, IQ3_XXS, IQ4_XS, etc.
+        | F32 | F16 | BF16 | FP16 | FP32
+    )
+    (?:[._-]\d+[-_]of[-_]\d+)?  # shard suffix BEFORE .gguf: -00001-of-00003
+    (?:\.gguf|\.safetensors)
+    (?:\.part\d+of\d+)?         # shard suffix AFTER .gguf (mradermacher: .part1of3)
+    $
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def model_name_signature(filename: str) -> tuple[str, str | None]:
+    """Return (base_model_name, quant_token) by stripping the quant suffix.
+
+    Returns (filename, None) when no recognized quant token is found —
+    such files are unique enough to skip from grouping."""
+    m = _QUANT_RE.search(filename)
+    if not m:
+        return (filename, None)
+    base = filename[: m.start()]
+    quant = m.group(1).upper()
+    # Normalize FP16 → F16 for grouping consistency
+    if quant == "FP16":
+        quant = "F16"
+    if quant == "FP32":
+        quant = "F32"
+    return (base, quant)
+
+
+def find_quant_clusters(roots: Iterable[Path]) -> dict[str, dict[str, list[Path]]]:
+    """Walk every root for *.gguf and *.safetensors; group by base model name.
+
+    Returns: {base_name: {quant_token: [path1, path2, ...]}}
+    Multi-shard quants legitimately have multiple paths under one quant key.
+    """
+    out: dict[str, dict[str, list[Path]]] = defaultdict(lambda: defaultdict(list))
+    for root in roots:
+        if not root.exists() or not root.is_dir():
+            continue
+        for ext in (".gguf", ".safetensors"):
+            for path in root.rglob(f"*{ext}"):
+                try:
+                    if not path.is_file():
+                        continue
+                except OSError:
+                    continue
+                base, quant = model_name_signature(path.name)
+                if quant is None:
+                    continue  # not a recognized quant variant; skip
+                out[base][quant].append(path)
+    return out
+
+
+def quant_total_size(paths: list[Path]) -> int:
+    total = 0
+    for p in paths:
+        try:
+            total += p.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def recommend_keep_quant(quants_present: list[str]) -> str | None:
+    """Pick the most useful quant to keep from the available set."""
+    upper = [q.upper() for q in quants_present]
+    for pref in _KEEP_PREFERENCE:
+        if pref in upper:
+            return pref
+    # Otherwise: highest in the quality-descending list that's present
+    for q in _QUANT_TOKENS_ORDERED:
+        if q in upper:
+            return q
+    return quants_present[0] if quants_present else None
+
+
+def report_quant_clusters(
+    clusters: dict[str, dict[str, list[Path]]],
+    min_size_bytes: int = 0,
+    min_variants: int = 2,
+) -> tuple[int, int]:
+    """Print the multi-quant report. Returns (cluster_count, reclaimable_bytes)."""
+    # Drop clusters below the variant-count threshold and the size floor
+    interesting: list[tuple[str, dict[str, list[Path]], int, int]] = []
+    for base, by_quant in clusters.items():
+        if len(by_quant) < min_variants:
+            continue
+        cluster_total = sum(quant_total_size(paths) for paths in by_quant.values())
+        if cluster_total < min_size_bytes:
+            continue
+        keep = recommend_keep_quant(list(by_quant.keys()))
+        keep_size = quant_total_size(by_quant.get(keep, [])) if keep else 0
+        reclaim = cluster_total - keep_size
+        interesting.append((base, by_quant, cluster_total, reclaim))
+    if not interesting:
+        return (0, 0)
+    interesting.sort(key=lambda t: t[3], reverse=True)
+    total_reclaim = 0
+    print()
+    print("=" * 78)
+    print("Multi-quant clusters (same base model, different quants)")
+    print("=" * 78)
+    for base, by_quant, cluster_total, reclaim in interesting:
+        keep = recommend_keep_quant(list(by_quant.keys()))
+        total_reclaim += reclaim
+        print()
+        print(f"  Base: {base.rstrip('._-')}")
+        print(f"    {len(by_quant)} quants on disk, total {human_size(cluster_total)}; "
+              f"keep {keep} → reclaim {human_size(reclaim)}")
+        # Sort quants by quality (highest first) for display
+        order = {q: i for i, q in enumerate(_QUANT_TOKENS_ORDERED)}
+        sorted_quants = sorted(by_quant.items(), key=lambda kv: order.get(kv[0], 999))
+        for quant, paths in sorted_quants:
+            sz = quant_total_size(paths)
+            keep_marker = "  ← KEEP" if quant == keep else ""
+            print(f"      {quant:<8} {human_size(sz):>10}{keep_marker}")
+            for p in paths:
+                print(f"        - {p}")
+    return (len(interesting), total_reclaim)
+
+
 # ── main ─────────────────────────────────────────────────────────────
 
 
@@ -177,12 +331,50 @@ def main() -> int:
                     help="Emit JSON instead of human-readable report")
     ap.add_argument("--min-size", type=parse_size, default=0,
                     help="Skip blobs smaller than this (e.g. 100M, 1G)")
+    ap.add_argument("--mode", choices=["both", "blobs", "quants"], default="both",
+                    help=("Which analysis to run. blobs = sha256-* file dedup "
+                          "(byte-identical); quants = same-base-model multi-quant "
+                          "clusters in *.gguf/*.safetensors (every quant of one "
+                          "model). Default both. Use `quants` alone if you only "
+                          "care about \"I pulled the whole repo, now I have 8 "
+                          "quants of one model\" cleanup."))
+    ap.add_argument("--min-variants", type=int, default=2,
+                    help="In quants mode: only show clusters with at least N quant variants. Default 2.")
     args = ap.parse_args()
 
     roots = [Path(r).expanduser().resolve() for r in args.roots]
-    print(f"Scanning {len(roots)} root(s) for sha256-* blob files...", file=sys.stderr)
+    print(f"Scanning {len(roots)} root(s)...", file=sys.stderr)
     for r in roots:
         print(f"  - {r}", file=sys.stderr)
+
+    # ── Multi-quant cluster analysis (early — cheap stat()-only walk) ──
+    if args.mode in ("both", "quants"):
+        print(f"  Walking *.gguf and *.safetensors for multi-quant clusters...",
+              file=sys.stderr)
+        clusters = find_quant_clusters(roots)
+        cluster_count, quant_reclaim = report_quant_clusters(
+            clusters,
+            min_size_bytes=args.min_size,
+            min_variants=args.min_variants,
+        )
+        if cluster_count == 0:
+            print("\n(no multi-quant clusters meeting the variant threshold)")
+        else:
+            print()
+            print("=" * 78)
+            print("Multi-quant summary")
+            print("=" * 78)
+            print(f"  Clusters with >= {args.min_variants} quant(s): {cluster_count}")
+            print(f"  Total reclaimable if you keep one quant per cluster: {human_size(quant_reclaim)}")
+
+    if args.mode == "quants":
+        # Skip the sha256-blob analysis entirely
+        print()
+        print("Note: this script never deletes anything. Inspect the path list and")
+        print("decide which file(s) to remove manually.")
+        return 0
+
+    print(f"  Walking sha256-* files for byte-identical dups...", file=sys.stderr)
     blobs = find_blob_files(roots)
     in_use = in_use_blobs()
 
