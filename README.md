@@ -74,6 +74,20 @@ rm ~/.cache/model_manager/active_downloads.json
 
 ## Recent changes
 
+### 2026-05-13 (hfdownloader filter fix + default download root for exclusion prompt)
+
+**`model_manager.py`**
+
+Three related changes:
+
+1. **Critical fix: hfdownloader was silently downloading whole repos when a specific artifact was selected.** `hfdownloader_filter_terms_from_artifacts()` was returning full filenames like `Foo.i1-Q2_K.gguf` as `--filters` values. hfdownloader's filter matcher expects *short quant tag tokens* like `q4_0`, `q5_K_M`, `iq2_xxs` — when it can't find any of those tags in its filter list, it silently falls back to downloading the entire repo. Real-world impact: selecting one 77 GB GGUF quant from an `mradermacher` "kitchen sink" repo would start a 1+ TB pull. The function now uses `Artifact.quant` (e.g., `Q2_K` → `q2_k`) when available, and falls back to the filename stem (without extension) when the quant is unknown. Deduped, lowercased, multi-artifact selections concatenated correctly.
+
+2. **Safety abort for empty filters.** If artifacts were selected but `hfdownloader_filter_terms_from_artifacts()` returns nothing (unknown architecture, missing quant tag), the script now refuses to invoke hfdownloader and falls back to `snapshot_download` with `allow_patterns` — the Python path enforces filename-level filtering and can't accidentally pull a whole repo. A loud `ABORT` banner explains why and lists the offending artifact labels/quants/types.
+
+3. **Download-dispatch debug log.** New `hfdownloader-dispatch` event written to the debug log (and stderr in `--debug` mode) right before subprocess.run, containing: `repo_id`, `kind`, `target`, selected artifact labels and quants, filter terms, exclude terms, allow_patterns, and the full hfdownloader command. Without this, an unexpected pull was hard to diagnose because hfdownloader uses an alternate screen buffer that wipes modelmgr's preceding output once it exits. Now `cat /tmp/modelmgr-debug.log | grep hfdownloader-dispatch` reproduces the exact decision context.
+
+4. **Existing-dirs prompt now defaults to `DEFAULT_DOWNLOAD_DIR`.** The "Already-downloaded filter" prompt previously defaulted to empty; users had to type their model directory (or set `MODEL_MANAGER_EXISTING_DIRS`) every search. Most users want to exclude things sitting in their main downloads root, so the prompt falls back to `DEFAULT_DOWNLOAD_DIR` when the env var is unset. Type `none` (instead of Enter) to opt out for a specific search. Precedence: `MODEL_MANAGER_EXISTING_DIRS` → `DEFAULT_DOWNLOAD_DIR` → empty.
+
 ### 2026-05-11 (later — conversion triage + sanitizer 3.9 compat)
 
 **`model_conversion.py`**

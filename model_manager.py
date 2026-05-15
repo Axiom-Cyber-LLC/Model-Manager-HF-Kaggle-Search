@@ -151,12 +151,18 @@ ACTIVE_DOWNLOADS_PATH = CACHE_DIR / "active_downloads.json"
 # local_dir is set (the docstring claims cache_dir is unused but the code disagrees). Steer
 # those stubs into a throwaway dir so they never pollute HF_HUB_CACHE.
 HF_STUB_CACHE_DIR = CACHE_DIR / "hf_refs_stubs"
-DEFAULT_HF_DOWNLOAD_MAX_WORKERS = 2
+DEFAULT_HF_DOWNLOAD_MAX_WORKERS = 3
 DEFAULT_HF_XET_RANGE_GETS = 16
 DEFAULT_HFDOWNLOADER_CONNECTIONS = 4
-DEFAULT_HFDOWNLOADER_MAX_ACTIVE = 1
+DEFAULT_HFDOWNLOADER_MAX_ACTIVE = 2
 DEFAULT_DOWNLOAD_RETRY_ATTEMPTS = 4
 DEFAULT_DOWNLOAD_RETRY_BASE_DELAY_SECONDS = 3
+# Threshold above which the predownload check requires explicit confirmation.
+# Set high enough that everyday model pulls don't trip it, but low enough to
+# catch "I accidentally selected a kitchen-sink mradermacher repo" mistakes.
+# Override per-session with --large-download-warn-gb or env var
+# MODEL_MANAGER_LARGE_DOWNLOAD_WARN_GB (set to 0 to disable entirely).
+DEFAULT_LARGE_DOWNLOAD_WARN_GB = 85
 HFDOWNLOADER_SAFE_FILTER_ARTIFACT_TYPES = {"gguf", "gguf-split", "safetensors", "safetensors-sharded"}
 MULTIPART_ARTIFACT_TYPES = {"gguf-split", "safetensors-sharded"}
 HFDOWNLOADER_MODEL_EXCLUDE_TERMS = [
@@ -711,20 +717,46 @@ def find_hfdownloader_binary() -> Path | None:
 
 
 def hfdownloader_filter_terms_from_artifacts(artifacts: list[Artifact] | None) -> list[str]:
+    """Build the `--filters` value for hfdownloader from selected artifacts.
+
+    hfdownloader's `--filters` flag expects short *quant tag tokens* that
+    appear inside LFS filenames (e.g. `q4_0`, `q5_K_M`, `iq2_xxs`,
+    `bf16`). Its matcher fails to recognize a full filename like
+    `Foo-Bar.i1-Q2_K.gguf` and silently falls back to downloading the
+    whole repo — that's how a 77 GB artifact selection turned into a
+    1 TB pull.
+
+    Strategy:
+      1. If the artifact has a recognized quant tag, use that (preferred).
+      2. Otherwise, fall back to file BASENAME WITHOUT EXTENSION — which
+         in practice still contains the quant tag and matches hfdownloader's
+         filename-substring logic, while avoiding the `.gguf` suffix and
+         path separators that confuse it.
+    Returns deduped, lowercase tokens.
+    """
     if not artifacts:
         return []
     terms: list[str] = []
     seen: set[str] = set()
+
+    def _add(token: str) -> None:
+        tok = token.strip().lower()
+        if tok and tok not in seen:
+            seen.add(tok)
+            terms.append(tok)
+
     for art in artifacts:
+        if art.quant and art.quant != "-":
+            _add(art.quant)
+            continue
         for name, _ in art.files:
             base = Path(name).name.strip()
             if not base:
                 continue
-            lower = base.lower()
-            if lower in seen:
-                continue
-            seen.add(lower)
-            terms.append(base)
+            # Strip the extension so the matcher sees the meaningful tail
+            # (which usually contains the quant code).
+            stem = base.rsplit(".", 1)[0] if "." in base else base
+            _add(stem)
     return terms
 
 
@@ -1454,15 +1486,27 @@ def parse_existing_dirs_value(value: str | None) -> list[Path]:
 
 def prompt_existing_dirs() -> list[Path]:
     """Ask the user once per search for directories whose contents should be
-    excluded from results. Returns [] if the user skips."""
+    excluded from results. Returns [] if the user skips. Default order of
+    precedence:
+      1. MODEL_MANAGER_EXISTING_DIRS env var (explicit user override)
+      2. DEFAULT_DOWNLOAD_DIR (almost everyone wants to exclude things
+         already sitting in their main downloads root)
+    """
     default = os.environ.get("MODEL_MANAGER_EXISTING_DIRS", "").strip()
+    default_source = "env" if default else None
+    if not default and DEFAULT_DOWNLOAD_DIR.exists() and DEFAULT_DOWNLOAD_DIR.is_dir():
+        default = str(DEFAULT_DOWNLOAD_DIR)
+        default_source = "download-root"
     print()
     print("Already-downloaded filter")
     print("  Provide one or more directories — any owner/repo found inside")
     print("  will be hidden from results. Separate with `:` or `,`. Press")
-    print("  Enter to skip. Set MODEL_MANAGER_EXISTING_DIRS to default this.")
-    if default:
+    print("  Enter to accept the default, or type `none` to skip.")
+    print("  Set MODEL_MANAGER_EXISTING_DIRS to override the default.")
+    if default and default_source == "env":
         print(f"  Default (from env): {default}")
+    elif default and default_source == "download-root":
+        print(f"  Default (download root): {default}")
     raw = prompt("Directories with already-downloaded models/datasets", default).strip()
     if not raw or raw.lower() in {"none", "no", "n", "-", "skip"}:
         return []
@@ -3102,17 +3146,29 @@ def show_artifact_picker_for_repo(result: SearchResult) -> bool:
         first = art.files[0][0] if art.files else art.label
         extra = f" +{len(art.files)-1} files" if len(art.files) > 1 else ""
         print(f"{art.index:>4}  {human_size(art.total_size):>12}  {art.artifact_type:<22}  {quant:<10}  {first}{extra}")
+    # Single prompt for the picker — the previous flow asked for a "mode"
+    # first (artifact_numbers / whole_repo / skip), then re-prompted for
+    # numbers. 95% of the time the user wants numbers; "whole" and "skip"
+    # are rare enough to be inline keywords here.
     print()
-    mode = prompt_choice("Select from this repo", ["artifact_numbers", "whole_repo", "skip"], "artifact_numbers")
-    if mode == "skip":
+    print(f"Pick artifact(s) from repo {result.index}.")
+    print(f"  Numbers: 1 | 1,3 | 2-4 | all")
+    print(f"  Or keyword: `whole` (entire {human_size(result.size_bytes)} repo) | `skip` / Enter (cancel)")
+    raw = prompt("Which artifact(s)?", "skip").strip().lower()
+    if not raw or raw in {"skip", "n", "no", "none", "-"}:
         return False
-    if mode == "whole_repo":
+    if raw in {"whole", "whole_repo", "wholerepo", "all-repo", "everything"}:
         if prompt_bool(f"Whole repo is {human_size(result.size_bytes)}. Select whole repo?", False):
             result.whole_repo_selected = True
             return True
         return False
-    nums = parse_selection(prompt("Which artifact numbers? Examples: 1, 1,3, 2-4, all"), len(artifacts))
+    try:
+        nums = parse_selection(raw, len(artifacts))
+    except ValueError as e:
+        print(f"  Could not parse {raw!r}: {e}. Nothing selected.")
+        return False
     if not nums:
+        print(f"  No valid artifact numbers in {raw!r}. Nothing selected.")
         return False
     for n in nums:
         art = artifacts[n - 1]
@@ -4074,6 +4130,42 @@ def download_hf_with_hfdownloader(
     excludes = hfdownloader_exclude_terms_for_artifacts(artifacts)
     if excludes:
         cmd.extend(["--exclude", ",".join(excludes)])
+
+    # Loud safety check: if we selected specific artifacts but ended up with
+    # no `--filters` to constrain hfdownloader, that's the silent-whole-repo
+    # bug we just fixed. Refuse rather than start a TB-scale pull.
+    if artifacts and not filters:
+        print()
+        print("=" * 78)
+        print("ABORT: artifact selection produced no hfdownloader filter terms.")
+        print("=" * 78)
+        for art in artifacts:
+            print(f"  - {art.label}  (quant={art.quant!r}, type={art.artifact_type!r})")
+        print()
+        print("Without `--filters`, hfdownloader would pull the whole repo.")
+        print("This usually means the Artifact lacks a recognizable quant tag.")
+        print("Falling back to the Python downloader, which honors allow_patterns directly.")
+        debug_log(
+            "hfdownloader-filter-empty",
+            repo_id=result.repo_id,
+            artifact_count=len(artifacts),
+            artifact_labels=[a.label for a in artifacts],
+            artifact_quants=[a.quant for a in artifacts],
+        )
+        return None  # caller falls back to snapshot_download with allow_patterns
+
+    debug_log(
+        "hfdownloader-dispatch",
+        repo_id=result.repo_id,
+        kind=result.kind,
+        target=str(target),
+        selected_artifact_labels=[a.label for a in (artifacts or [])],
+        selected_artifact_quants=[a.quant for a in (artifacts or [])],
+        filter_terms=filters,
+        exclude_terms=excludes,
+        allow_patterns=allow_patterns,
+        cmd=cmd,
+    )
 
     endpoint = os.getenv("MODEL_MANAGER_HF_ENDPOINT") or os.getenv("HF_ENDPOINT")
     if endpoint:
@@ -5275,6 +5367,37 @@ def predownload_risk_and_completeness_check(
     print(f"Expected selected files: {len(expected)}")
     print(f"Expected selected size: {human_size(expected_size or result.size_bytes)}")
 
+    # Large-download warning. Catches "I accidentally selected a kitchen-sink
+    # repo" / "whole-repo dispatch had a bug" cases before they spend hours
+    # downloading things you didn't want. Default 85 GB; override per session
+    # with --large-download-warn-gb or env MODEL_MANAGER_LARGE_DOWNLOAD_WARN_GB
+    # (set to 0 to disable). Use the actual selected size (not repo total)
+    # so single-quant picks from huge multi-quant repos don't over-warn.
+    warn_threshold_gb = env_int(
+        "MODEL_MANAGER_LARGE_DOWNLOAD_WARN_GB",
+        DEFAULT_LARGE_DOWNLOAD_WARN_GB,
+        minimum=0,
+    )
+    size_for_check = expected_size if expected_size > 0 else (result.size_bytes or 0)
+    if warn_threshold_gb > 0 and size_for_check > warn_threshold_gb * (1024 ** 3):
+        print()
+        print("=" * 78)
+        print("LARGE DOWNLOAD WARNING")
+        print("=" * 78)
+        print(f"  Selection size: {human_size(size_for_check)}")
+        print(f"  Threshold:      {warn_threshold_gb} GB")
+        print(f"  Files:          {len(expected) or '?'}")
+        print(f"  Selection:      {selected_label}")
+        print(f"  Repo:           {result.repo_id}")
+        print()
+        print("  This is a large download. It will take significant time and disk space.")
+        print("  Press Enter or `n` to cancel; type `y` to proceed.")
+        print(f"  Adjust threshold via --large-download-warn-gb or env "
+              "MODEL_MANAGER_LARGE_DOWNLOAD_WARN_GB (0 = disable).")
+        if not prompt_bool(f"Proceed with {human_size(size_for_check)} download?", False):
+            print("  Skipped (large-download cancellation).")
+            return False
+
     try:
         total, used, free = shutil.disk_usage(download_root)
         print(f"Download root free space: {human_size(free)}")
@@ -6256,6 +6379,16 @@ def main() -> int:
             "to interactive prompt if unset."
         ),
     )
+    ap.add_argument(
+        "--large-download-warn-gb",
+        type=int,
+        help=(
+            f"Selected-download size (in GB) above which the predownload check "
+            f"requires explicit confirmation. Default {DEFAULT_LARGE_DOWNLOAD_WARN_GB}. "
+            "Set to 0 to disable the warning entirely. Also configurable via env "
+            "MODEL_MANAGER_LARGE_DOWNLOAD_WARN_GB."
+        ),
+    )
     ap.add_argument("--search-source", choices=["huggingface", "kaggle", "both"], help="Search source")
     ap.add_argument("--result-limit", type=int, help="Results per source/type/search term")
     ap.add_argument("--page-size", type=int, help="Displayed result batch size")
@@ -6271,6 +6404,11 @@ def main() -> int:
     ap.add_argument("--debug", action="store_true", help="Print picker/search debug traces to stderr")
     ap.add_argument("--debug-log", help="Optional file path for debug traces when --debug is enabled")
     args = ap.parse_args()
+    # Plumb --large-download-warn-gb through env so the env_int read in
+    # predownload_risk_and_completeness_check picks it up without having
+    # to thread a parameter through five call sites.
+    if getattr(args, "large_download_warn_gb", None) is not None:
+        os.environ["MODEL_MANAGER_LARGE_DOWNLOAD_WARN_GB"] = str(int(args.large_download_warn_gb))
     configure_debug_mode(args.debug or DEBUG_ENABLED, args.debug_log or (str(DEBUG_LOG_PATH) if DEBUG_LOG_PATH else None))
     debug_log("main-args", args=vars(args))
     if DEBUG_ENABLED:
