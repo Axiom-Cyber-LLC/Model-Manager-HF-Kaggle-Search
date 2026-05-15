@@ -151,12 +151,18 @@ ACTIVE_DOWNLOADS_PATH = CACHE_DIR / "active_downloads.json"
 # local_dir is set (the docstring claims cache_dir is unused but the code disagrees). Steer
 # those stubs into a throwaway dir so they never pollute HF_HUB_CACHE.
 HF_STUB_CACHE_DIR = CACHE_DIR / "hf_refs_stubs"
-DEFAULT_HF_DOWNLOAD_MAX_WORKERS = 2
+DEFAULT_HF_DOWNLOAD_MAX_WORKERS = 3
 DEFAULT_HF_XET_RANGE_GETS = 16
 DEFAULT_HFDOWNLOADER_CONNECTIONS = 4
-DEFAULT_HFDOWNLOADER_MAX_ACTIVE = 1
+DEFAULT_HFDOWNLOADER_MAX_ACTIVE = 2
 DEFAULT_DOWNLOAD_RETRY_ATTEMPTS = 4
 DEFAULT_DOWNLOAD_RETRY_BASE_DELAY_SECONDS = 3
+# Threshold above which the predownload check requires explicit confirmation.
+# Set high enough that everyday model pulls don't trip it, but low enough to
+# catch "I accidentally selected a kitchen-sink mradermacher repo" mistakes.
+# Override per-session with --large-download-warn-gb or env var
+# MODEL_MANAGER_LARGE_DOWNLOAD_WARN_GB (set to 0 to disable entirely).
+DEFAULT_LARGE_DOWNLOAD_WARN_GB = 85
 HFDOWNLOADER_SAFE_FILTER_ARTIFACT_TYPES = {"gguf", "gguf-split", "safetensors", "safetensors-sharded"}
 MULTIPART_ARTIFACT_TYPES = {"gguf-split", "safetensors-sharded"}
 HFDOWNLOADER_MODEL_EXCLUDE_TERMS = [
@@ -5361,6 +5367,37 @@ def predownload_risk_and_completeness_check(
     print(f"Expected selected files: {len(expected)}")
     print(f"Expected selected size: {human_size(expected_size or result.size_bytes)}")
 
+    # Large-download warning. Catches "I accidentally selected a kitchen-sink
+    # repo" / "whole-repo dispatch had a bug" cases before they spend hours
+    # downloading things you didn't want. Default 85 GB; override per session
+    # with --large-download-warn-gb or env MODEL_MANAGER_LARGE_DOWNLOAD_WARN_GB
+    # (set to 0 to disable). Use the actual selected size (not repo total)
+    # so single-quant picks from huge multi-quant repos don't over-warn.
+    warn_threshold_gb = env_int(
+        "MODEL_MANAGER_LARGE_DOWNLOAD_WARN_GB",
+        DEFAULT_LARGE_DOWNLOAD_WARN_GB,
+        minimum=0,
+    )
+    size_for_check = expected_size if expected_size > 0 else (result.size_bytes or 0)
+    if warn_threshold_gb > 0 and size_for_check > warn_threshold_gb * (1024 ** 3):
+        print()
+        print("=" * 78)
+        print("LARGE DOWNLOAD WARNING")
+        print("=" * 78)
+        print(f"  Selection size: {human_size(size_for_check)}")
+        print(f"  Threshold:      {warn_threshold_gb} GB")
+        print(f"  Files:          {len(expected) or '?'}")
+        print(f"  Selection:      {selected_label}")
+        print(f"  Repo:           {result.repo_id}")
+        print()
+        print("  This is a large download. It will take significant time and disk space.")
+        print("  Press Enter or `n` to cancel; type `y` to proceed.")
+        print(f"  Adjust threshold via --large-download-warn-gb or env "
+              "MODEL_MANAGER_LARGE_DOWNLOAD_WARN_GB (0 = disable).")
+        if not prompt_bool(f"Proceed with {human_size(size_for_check)} download?", False):
+            print("  Skipped (large-download cancellation).")
+            return False
+
     try:
         total, used, free = shutil.disk_usage(download_root)
         print(f"Download root free space: {human_size(free)}")
@@ -6342,6 +6379,16 @@ def main() -> int:
             "to interactive prompt if unset."
         ),
     )
+    ap.add_argument(
+        "--large-download-warn-gb",
+        type=int,
+        help=(
+            f"Selected-download size (in GB) above which the predownload check "
+            f"requires explicit confirmation. Default {DEFAULT_LARGE_DOWNLOAD_WARN_GB}. "
+            "Set to 0 to disable the warning entirely. Also configurable via env "
+            "MODEL_MANAGER_LARGE_DOWNLOAD_WARN_GB."
+        ),
+    )
     ap.add_argument("--search-source", choices=["huggingface", "kaggle", "both"], help="Search source")
     ap.add_argument("--result-limit", type=int, help="Results per source/type/search term")
     ap.add_argument("--page-size", type=int, help="Displayed result batch size")
@@ -6357,6 +6404,11 @@ def main() -> int:
     ap.add_argument("--debug", action="store_true", help="Print picker/search debug traces to stderr")
     ap.add_argument("--debug-log", help="Optional file path for debug traces when --debug is enabled")
     args = ap.parse_args()
+    # Plumb --large-download-warn-gb through env so the env_int read in
+    # predownload_risk_and_completeness_check picks it up without having
+    # to thread a parameter through five call sites.
+    if getattr(args, "large_download_warn_gb", None) is not None:
+        os.environ["MODEL_MANAGER_LARGE_DOWNLOAD_WARN_GB"] = str(int(args.large_download_warn_gb))
     configure_debug_mode(args.debug or DEBUG_ENABLED, args.debug_log or (str(DEBUG_LOG_PATH) if DEBUG_LOG_PATH else None))
     debug_log("main-args", args=vars(args))
     if DEBUG_ENABLED:
