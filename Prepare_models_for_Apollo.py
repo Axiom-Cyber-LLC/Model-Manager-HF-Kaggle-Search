@@ -4,22 +4,24 @@ import argparse, os, re, shutil, sys, threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from prepare_models_env import extend_scan_roots
+
 HOME = Path.home()
-DEFAULT_ROOTS = [
-    Path("/Volumes/ModelStorage/models"),
-    Path("/Volumes/ModelStorage/models-flat"),
-    Path("/Volumes/ModelStorage/models/huggingface/model"),
-    Path("/Volumes/ModelStorage/models-flat/local"),
-    Path("/Volumes/ModelStorage/.cache/huggingface"),
+DEFAULT_ROOTS = extend_scan_roots([
+    Path("<Your Model Directory>"),
+    Path("<Your Model Directory>"),
+    Path("<Your Model Directory>/huggingface/model"),
+    Path("<Your Model Directory>/local"),
+    Path("<REDACTED_PATH>"),
     HOME / ".cache" / "huggingface",
-    Path("/Volumes/ModelStorage/.cache/modelscope"),
-    Path("/Volumes/ModelStorage/.cache/model_manager"),
+    Path("<Your Model Directory>"),
+    Path("<REDACTED_PATH>"),
     HOME / "model_downloads" / "huggingface" / "model",
     HOME / "Library" / "Application Support" / "nomic.ai" / "GPT4All",
     HOME / ".lmstudio" / "models",
-    Path("~/skill-scanner/scan-results/20260503T074319Z"),
-    Path("~/skill-scanner/scan-results/20260503T074334Z"),
-]
+    Path("<REDACTED_PATH>"),
+    Path("<REDACTED_PATH>"),
+])
 SKIP_DIR_NAMES = {"blobs", ".locks", "refs", ".studio_links", ".git", "__pycache__"}
 MIN_GGUF_BYTES = 50 * 1024 * 1024
 GGUF_MAGIC = b"GGUF"

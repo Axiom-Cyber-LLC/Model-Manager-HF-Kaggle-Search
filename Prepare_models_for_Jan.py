@@ -2,14 +2,14 @@
 """
 Prepare existing local models for Jan (jan.ai).
 
-Canonical models live in LM Studio's directory (~/.lmstudio/models/).
+Canonical models live in LM Studio's directory (<REDACTED_PATH>).
 This script creates SYMLINKS inside Jan's models directories so Jan can
 load them without duplicating gigabytes of weights.
 
 Jan on macOS uses two backends:
-  - llama.cpp (GGUF):  ~/Library/Application Support/Jan/data/llamacpp/models/{id}/model.gguf
+  - llama.cpp (GGUF):  <REDACTED_PATH> Support/Jan/data/llamacpp/models/{id}/model.gguf
                        + model.yml metadata sibling file
-  - MLX (directories): ~/Library/Application Support/Jan/data/mlx/models/{id}/
+  - MLX (directories): <REDACTED_PATH> Support/Jan/data/mlx/models/{id}/
                        whole directory with config.json + tokenizer + *.safetensors
 
 Usage:
@@ -28,6 +28,8 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from prepare_models_env import extend_scan_roots
+
 _print_lock = threading.Lock()
 def _log(msg):
     with _print_lock:
@@ -37,39 +39,39 @@ HOME = Path.home()
 
 # Unified scan roots — searched recursively (rglob, unlimited depth)
 # and deduped at link-creation time by safe_symlink. Missing roots skipped.
-DEFAULT_GGUF_ROOTS = [
-    Path("/Volumes/ModelStorage/models"),
-    Path("/Volumes/ModelStorage/models-flat"),
-    Path("/Volumes/ModelStorage/models/huggingface/model"),
-    Path("/Volumes/ModelStorage/models-flat/local"),
-    Path("/Volumes/ModelStorage/.cache/huggingface"),
+DEFAULT_GGUF_ROOTS = extend_scan_roots([
+    Path("<Your Model Directory>"),
+    Path("<Your Model Directory>"),
+    Path("<Your Model Directory>/huggingface/model"),
+    Path("<Your Model Directory>/local"),
+    Path("<REDACTED_PATH>"),
     HOME / ".cache" / "huggingface",   # symlink to the SSDE one
-    Path("/Volumes/ModelStorage/.cache/modelscope"),
-    Path("/Volumes/ModelStorage/.cache/model_manager"),
+    Path("<Your Model Directory>"),
+    Path("<REDACTED_PATH>"),
     HOME / "model_downloads" / "huggingface" / "model",
     HOME / "Library" / "Application Support" / "nomic.ai" / "GPT4All",
     HOME / ".lmstudio" / "models",     # legacy fallback
-    Path("~/skill-scanner/scan-results/20260503T074319Z"),
-    Path("~/skill-scanner/scan-results/20260503T074334Z"),
-]
+    Path("<REDACTED_PATH>"),
+    Path("<REDACTED_PATH>"),
+])
 # MLX roots = unified set + MLX-specific extras
-DEFAULT_MLX_ROOTS = [
-    Path("/Volumes/ModelStorage/models"),
-    Path("/Volumes/ModelStorage/models-flat"),
-    Path("/Volumes/ModelStorage/models/huggingface/model"),
-    Path("/Volumes/ModelStorage/models-flat/local"),
-    Path("/Volumes/ModelStorage/.cache/huggingface"),
+DEFAULT_MLX_ROOTS = extend_scan_roots([
+    Path("<Your Model Directory>"),
+    Path("<Your Model Directory>"),
+    Path("<Your Model Directory>/huggingface/model"),
+    Path("<Your Model Directory>/local"),
+    Path("<REDACTED_PATH>"),
     HOME / ".cache" / "huggingface",
-    Path("/Volumes/ModelStorage/.cache/modelscope"),
-    Path("/Volumes/ModelStorage/.cache/model_manager"),
+    Path("<Your Model Directory>"),
+    Path("<REDACTED_PATH>"),
     HOME / "model_downloads" / "huggingface" / "model",
     HOME / "Library" / "Application Support" / "nomic.ai" / "GPT4All",
     HOME / "mlx-lm",
     HOME / "Library" / "Caches" / "huggingface" / "hub",
     HOME / ".lmstudio" / "models",
-    Path("~/skill-scanner/scan-results/20260503T074319Z"),
-    Path("~/skill-scanner/scan-results/20260503T074334Z"),
-]
+    Path("<REDACTED_PATH>"),
+    Path("<REDACTED_PATH>"),
+])
 
 # Jan's target directories
 JAN_ROOT = HOME / "Library" / "Application Support" / "Jan" / "data"
