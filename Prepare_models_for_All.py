@@ -36,10 +36,12 @@ import sys
 import time
 from pathlib import Path
 
+from prepare_models_env import export_prep_environment
+
 # Find model_audit (it lives next to the prepare scripts)
 _AUDIT_PATHS = [
+    Path("<Your Model Directory>"),
     Path(__file__).resolve().parent,
-    Path("/Volumes/ModelStorage/models-flat"),
 ]
 for _p in _AUDIT_PATHS:
     if (_p / "model_audit.py").is_file() and str(_p) not in sys.path:
@@ -52,7 +54,7 @@ except ImportError:
     _HAS_AUDIT = False
 
 
-DEFAULT_SCRIPTS_DIR = Path(__file__).resolve().parent
+DEFAULT_SCRIPTS_DIR = Path("<REDACTED_PATH>")
 
 # Order matters — see module docstring.
 APP_ORDER = [
@@ -138,9 +140,18 @@ def main() -> int:
                     help="Comma-list of app names to include (Lmstudio,Ollama,…)")
     ap.add_argument("--skip", type=str, default=None,
                     help="Comma-list of app names to skip")
+    ap.add_argument("--model-dir", type=Path, default=None,
+                    help="Specific downloaded model directory to prioritize while scanning")
+    ap.add_argument("--download-dir", type=Path, default=None,
+                    help="Alias for --model-dir")
+    ap.add_argument("--download-root", type=Path, default=None,
+                    help="Download root to add to every child's scan roots")
     ap.add_argument("--continue-on-error", action="store_true",
                     help="Keep running subsequent steps even if one fails")
     args = ap.parse_args()
+
+    model_dir = args.model_dir or args.download_dir
+    prep_paths = export_prep_environment(model_dir=model_dir, download_root=args.download_root)
 
     print("=" * 78)
     print(f"Prepare_models_for_All — {'DRY RUN' if args.dry_run else 'LIVE'}")
@@ -157,6 +168,10 @@ def main() -> int:
     print(f"  scripts dir: {args.scripts_dir}")
     print(f"  apps:        {', '.join(apps)}")
     print(f"  workers:     {args.workers}")
+    if prep_paths["download_target"] is not None:
+        print(f"  model dir:   {prep_paths['download_target']}")
+    if prep_paths["download_root"] is not None:
+        print(f"  dl root:     {prep_paths['download_root']}")
     print()
 
     # 1) Audit step

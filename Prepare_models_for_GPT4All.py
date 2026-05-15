@@ -3,7 +3,7 @@
 Prepare existing local models for GPT4All.
 
 GPT4All on macOS auto-discovers any .gguf file sitting in:
-    ~/Library/Application Support/nomic.ai/GPT4All/
+    <REDACTED_PATH> Support/nomic.ai/GPT4All/
 
 This script creates SYMLINKS to the canonical LM Studio copies so you don't
 duplicate the weights. Filenames are flattened as {author}__{model}__{file}.gguf
@@ -22,6 +22,8 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from prepare_models_env import extend_scan_roots
+
 _print_lock = threading.Lock()
 def _log(msg):
     with _print_lock:
@@ -35,21 +37,21 @@ GPT4ALL_DIR = HOME / "Library" / "Application Support" / "nomic.ai" / "GPT4All"
 # kept in this shared list for cross-app consistency, then filtered out at
 # runtime in this script (see source-root resolution in main()) to avoid
 # walking our own destination as a source.
-DEFAULT_GGUF_ROOTS = [
-    Path("/Volumes/ModelStorage/models"),
-    Path("/Volumes/ModelStorage/models-flat"),
-    Path("/Volumes/ModelStorage/models/huggingface/model"),
-    Path("/Volumes/ModelStorage/models-flat/local"),
-    Path("/Volumes/ModelStorage/.cache/huggingface"),
+DEFAULT_GGUF_ROOTS = extend_scan_roots([
+    Path("<Your Model Directory>"),
+    Path("<Your Model Directory>"),
+    Path("<Your Model Directory>/huggingface/model"),
+    Path("<Your Model Directory>/local"),
+    Path("<REDACTED_PATH>"),
     HOME / ".cache" / "huggingface",   # symlink to the SSDE one
-    Path("/Volumes/ModelStorage/.cache/modelscope"),
-    Path("/Volumes/ModelStorage/.cache/model_manager"),
+    Path("<Your Model Directory>"),
+    Path("<REDACTED_PATH>"),
     HOME / "model_downloads" / "huggingface" / "model",
     GPT4ALL_DIR,                       # filtered out at runtime — we ARE this dir
     HOME / ".lmstudio" / "models",     # legacy fallback
-    Path("~/skill-scanner/scan-results/20260503T074319Z"),
-    Path("~/skill-scanner/scan-results/20260503T074334Z"),
-]
+    Path("<REDACTED_PATH>"),
+    Path("<REDACTED_PATH>"),
+])
 GGUF_EXT = ".gguf"
 
 # Directory tokens we never DESCEND into below a scan root. These are
