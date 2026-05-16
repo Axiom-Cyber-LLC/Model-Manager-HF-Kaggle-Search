@@ -4277,7 +4277,13 @@ def _record_active_download(
     staging_path: Path,
     downloader: str,
 ) -> str:
-    """Add a record. Returns the record id so the caller can clear it later."""
+    """Add a record. Returns the record id so the caller can clear it later.
+
+    Dedupes by `(repo_id, kind, staging_path)` — if a record already exists
+    for that triple, it gets REPLACED instead of duplicated. Prevents the
+    "I tried this download twice and now have two queue entries that both
+    fail with the same gated-repo error" pattern.
+    """
     rec_id = f"{int(time.time())}-{abs(hash((repo_id, downloader))) % 100000:05d}"
     record = {
         "id": rec_id,
@@ -4291,6 +4297,17 @@ def _record_active_download(
         "downloader": downloader,
     }
     records = _load_active_downloads()
+    # Drop any existing record(s) for the same (repo_id, kind, staging_path)
+    # before appending the new one. Same staging path = same download intent.
+    dedup_key = (repo_id, kind, str(staging_path))
+    before = len(records)
+    records = [
+        r for r in records
+        if (r.get("repo_id"), r.get("kind"), r.get("staging_path")) != dedup_key
+    ]
+    if len(records) < before:
+        # Silent dedup — common during normal retries; only worth a debug log
+        debug_log("active-download-dedup", repo_id=repo_id, removed=before - len(records))
     records.append(record)
     _save_active_downloads(records)
     return rec_id
@@ -4697,7 +4714,26 @@ def _resume_one_download(rec: dict) -> None:
         else:
             target = download_hf_result(result, download_root, allow_patterns, artifacts=[])
     except Exception as e:
-        print(f"  ✗ resume error: {type(e).__name__}: {e}")
+        # Distinguish permanent errors (retry will never succeed) from
+        # transient ones. Permanent errors clear the queue record so the
+        # user doesn't get re-prompted to resume the same broken download
+        # every session forever.
+        exc_name = type(e).__name__
+        msg = str(e)
+        permanent = exc_name in {
+            "GatedRepoError",            # need to request access
+            "RepositoryNotFoundError",   # repo doesn't exist (anymore)
+            "EntryNotFoundError",        # specific file gone from the repo
+            "RevisionNotFoundError",     # the recorded revision is gone
+            "HfHubHTTPError",            # general HF auth/permission HTTP errors
+        } or "401" in msg or "403" in msg or "404" in msg
+        if permanent:
+            print(f"  ✗ PERMANENT resume failure for {repo_id}: {exc_name}: {msg[:200]}")
+            print(f"    → Clearing queue record (retrying will never succeed for this error).")
+            print(f"    → If you regain access (e.g., request approval), re-add manually with `modelmgr --search`.")
+            _clear_active_download(rec.get("id", ""))
+        else:
+            print(f"  ✗ resume error (transient — record kept for next attempt): {exc_name}: {msg[:200]}")
         return
 
     if target:
