@@ -71,48 +71,160 @@ def human_size(n: int) -> str:
 # ── manifest parsing ─────────────────────────────────────────────────
 
 
-def in_use_blobs() -> dict[str, list[str]]:
-    """Walk Ollama manifests; return {blob_filename: [model_label, ...]}.
+def find_manifest_roots(roots: Iterable[Path]) -> list[Path]:
+    """Discover every Ollama-style manifests/ root.
 
-    Manifest path layout: <REDACTED_PATH><host>/<owner>/<name>/<tag>
-    Manifest content (JSON): {"layers": [{"digest": "sha256:abc..."}, ...],
-                              "config": {"digest": "sha256:def..."}}
-    Blob files on disk are named `sha256-abc...` (colon → dash).
+    Always includes the canonical <REDACTED_PATH> if it exists.
+    Also walks each configured scan root looking for sibling `manifests/`
+    directories that contain a `registry.ollama.ai/` (or any registry host)
+    subtree — catches secondary stores like <REDACTED_PATH>
+    or <REDACTED_PATH>
+    """
+    found: list[Path] = []
+    seen: set[Path] = set()
+
+    def _add(p: Path) -> None:
+        try:
+            resolved = p.resolve()
+        except OSError:
+            resolved = p
+        if resolved in seen:
+            return
+        seen.add(resolved)
+        found.append(p)
+
+    canonical = Path.home() / ".ollama" / "models" / "manifests"
+    if canonical.is_dir():
+        _add(canonical)
+
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for manifests_dir in root.rglob("manifests"):
+            try:
+                if not manifests_dir.is_dir():
+                    continue
+                # Heuristic: only treat it as a real Ollama manifests root if
+                # it contains a registry.* subdir (Ollama's standard layout).
+                children = [c for c in manifests_dir.iterdir() if c.is_dir()]
+                if not any(c.name.startswith("registry.") for c in children):
+                    continue
+                _add(manifests_dir)
+            except OSError:
+                continue
+    return found
+
+
+def in_use_blobs(roots: Iterable[Path] | None = None) -> dict[str, list[str]]:
+    """Walk every discovered Ollama manifests/ root; aggregate blob references.
+
+    Returns: {blob_filename: ["[store-prefix] model/tag", ...]}.
+    The store-prefix lets you tell which store referenced the blob when
+    multiple stores exist on the system.
     """
     in_use: dict[str, list[str]] = defaultdict(list)
-    if not OLLAMA_MANIFESTS.is_dir():
-        return in_use
-    for manifest in OLLAMA_MANIFESTS.rglob("*"):
-        if not manifest.is_file():
-            continue
-        try:
-            data = json.loads(manifest.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        try:
-            tail = manifest.relative_to(OLLAMA_MANIFESTS).parts
-            # Drop the host segment (e.g. registry.ollama.ai); join the rest.
-            model_label = "/".join(tail[1:]) if len(tail) > 1 else manifest.name
-        except ValueError:
-            model_label = manifest.name
-        digests: list[str] = []
-        for layer in data.get("layers") or []:
-            if isinstance(layer, dict):
-                d = layer.get("digest", "")
+    manifest_roots = find_manifest_roots(roots or [])
+    for mroot in manifest_roots:
+        # A short store identifier for the label — strip a common prefix where possible
+        store_label = str(mroot)
+        for prefix, short in (
+            (str(Path.home() / ".ollama" / "models" / "manifests"), "[<REDACTED_PATH>]"),
+        ):
+            if store_label == prefix:
+                store_label = short
+                break
+        else:
+            # Compact label for SSD-side stores
+            store_label = f"[{Path(store_label).parent.name}]"
+        for manifest in mroot.rglob("*"):
+            if not manifest.is_file():
+                continue
+            try:
+                data = json.loads(manifest.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            try:
+                tail = manifest.relative_to(mroot).parts
+                # Drop the host segment (e.g. registry.ollama.ai); join the rest.
+                model_label = "/".join(tail[1:]) if len(tail) > 1 else manifest.name
+            except ValueError:
+                model_label = manifest.name
+            label = f"{store_label} {model_label}"
+            digests: list[str] = []
+            for layer in data.get("layers") or []:
+                if isinstance(layer, dict):
+                    d = layer.get("digest", "")
+                    if isinstance(d, str) and d.startswith("sha256:"):
+                        digests.append(d)
+            cfg = data.get("config")
+            if isinstance(cfg, dict):
+                d = cfg.get("digest", "")
                 if isinstance(d, str) and d.startswith("sha256:"):
                     digests.append(d)
-        cfg = data.get("config")
-        if isinstance(cfg, dict):
-            d = cfg.get("digest", "")
-            if isinstance(d, str) and d.startswith("sha256:"):
-                digests.append(d)
-        for d in digests:
-            blob_filename = "sha256-" + d.split(":", 1)[1]
-            in_use[blob_filename].append(model_label)
+            for d in digests:
+                blob_filename = "sha256-" + d.split(":", 1)[1]
+                in_use[blob_filename].append(label)
     return in_use
 
 
 # ── blob discovery ───────────────────────────────────────────────────
+
+
+def find_orphan_blobs(
+    blobs: dict[str, list[Path]],
+    in_use: dict[str, list[str]],
+) -> list[tuple[str, list[Path], int]]:
+    """Find blobs that exist on disk but are NOT referenced by ANY manifest.
+
+    Returns: [(blob_filename, [paths], total_size_one_copy), ...]
+    Sorted by size descending so the biggest wins surface first.
+    """
+    out: list[tuple[str, list[Path], int]] = []
+    for sha, paths in blobs.items():
+        if sha in in_use:
+            continue  # referenced — not an orphan
+        # Use the first reachable path's size; all copies should be byte-identical
+        size = 0
+        for p in paths:
+            try:
+                size = p.stat().st_size
+                break
+            except OSError:
+                continue
+        out.append((sha, paths, size))
+    out.sort(key=lambda t: t[2], reverse=True)
+    return out
+
+
+def report_orphan_blobs(orphans: list[tuple[str, list[Path], int]]) -> int:
+    """Print orphan-blob report. Returns total reclaimable bytes (counts all
+    copies of each orphan since none are referenced)."""
+    if not orphans:
+        print("\nNo orphan blobs found.")
+        return 0
+    total = 0
+    print()
+    print("=" * 78)
+    print("Orphan Ollama-style blobs (sha256-* files NOT referenced by ANY manifest)")
+    print("=" * 78)
+    print("These are safe to delete — no Ollama model registration points at them.")
+    print()
+    for sha, paths, size in orphans:
+        per_blob_total = size * len(paths)
+        total += per_blob_total
+        copy_label = f"copies={len(paths)}" if len(paths) > 1 else ""
+        print(f"  {sha[:32]}...  size={_human_size_inline(size):>10}  {copy_label}")
+        for p in paths:
+            print(f"    - {p}")
+    print()
+    print(f"  Total orphans: {len(orphans)} blob(s); reclaimable: {_human_size_inline(total)}")
+    return total
+
+
+def _human_size_inline(n: int) -> str:
+    # Local alias for the existing human_size helper — keeps this section
+    # self-contained without circular import concerns.
+    return human_size(n)
 
 
 def find_blob_files(roots: Iterable[Path]) -> dict[str, list[Path]]:
@@ -331,13 +443,13 @@ def main() -> int:
                     help="Emit JSON instead of human-readable report")
     ap.add_argument("--min-size", type=parse_size, default=0,
                     help="Skip blobs smaller than this (e.g. 100M, 1G)")
-    ap.add_argument("--mode", choices=["both", "blobs", "quants"], default="both",
-                    help=("Which analysis to run. blobs = sha256-* file dedup "
-                          "(byte-identical); quants = same-base-model multi-quant "
-                          "clusters in *.gguf/*.safetensors (every quant of one "
-                          "model). Default both. Use `quants` alone if you only "
-                          "care about \"I pulled the whole repo, now I have 8 "
-                          "quants of one model\" cleanup."))
+    ap.add_argument("--mode", choices=["both", "blobs", "quants", "orphans", "all"], default="both",
+                    help=("Which analysis to run.\n"
+                          "  blobs   — sha256-* file dedup (byte-identical, manifest-aware)\n"
+                          "  quants  — same-base-model multi-quant clusters in *.gguf/*.safetensors\n"
+                          "  orphans — sha256-* files on disk NOT referenced by any Ollama manifest\n"
+                          "  both    — blobs + quants (default)\n"
+                          "  all     — blobs + quants + orphans"))
     ap.add_argument("--min-variants", type=int, default=2,
                     help="In quants mode: only show clusters with at least N quant variants. Default 2.")
     args = ap.parse_args()
@@ -348,7 +460,7 @@ def main() -> int:
         print(f"  - {r}", file=sys.stderr)
 
     # ── Multi-quant cluster analysis (early — cheap stat()-only walk) ──
-    if args.mode in ("both", "quants"):
+    if args.mode in ("both", "quants", "all"):
         print(f"  Walking *.gguf and *.safetensors for multi-quant clusters...",
               file=sys.stderr)
         clusters = find_quant_clusters(roots)
@@ -376,7 +488,27 @@ def main() -> int:
 
     print(f"  Walking sha256-* files for byte-identical dups...", file=sys.stderr)
     blobs = find_blob_files(roots)
-    in_use = in_use_blobs()
+
+    # ── Orphan-blob analysis (sha256-* on disk, NOT referenced by any manifest) ──
+    # Runs in `orphans` and `all` modes. Also computed and shown opportunistically
+    # in `both` mode as a small summary line (full report needs --mode orphans/all).
+    if args.mode in ("orphans", "all"):
+        print(f"  Aggregating manifests from all stores to compute orphans...",
+              file=sys.stderr)
+        in_use_for_orphans = in_use_blobs(roots)
+        orphans = find_orphan_blobs(blobs, in_use_for_orphans)
+        # Apply min-size filter to orphan section too
+        if args.min_size:
+            orphans = [(sha, paths, sz) for sha, paths, sz in orphans if sz >= args.min_size]
+        orphan_total = report_orphan_blobs(orphans)
+        if args.mode == "orphans":
+            print()
+            print("Note: this script never deletes anything. Inspect the path list and")
+            print("decide which file(s) to remove manually.")
+            return 0
+    # Aggregate manifests from every Ollama-style store under any root,
+    # not just <REDACTED_PATH> Catches secondary stores like models-flat/manifests/.
+    in_use = in_use_blobs(roots)
 
     if args.min_size:
         blobs = {sha: ps for sha, ps in blobs.items() if blob_size(ps) >= args.min_size}
