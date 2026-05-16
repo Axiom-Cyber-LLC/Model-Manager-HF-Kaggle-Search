@@ -5969,22 +5969,72 @@ def run_search_flow(options: argparse.Namespace | None = None) -> None:
     )
 
     specific_repo_arg = getattr(options, "specific_repo", None) if options is not None else None
-    if specific_repo_arg or (options is None and prompt_bool("Do you have a single specific model or dataset to download?", False)):
-        value = specific_repo_arg or prompt("Paste Hugging Face repo ID or URL", "")
-        repo_id = parse_hf_repo_id(value)
-        if not repo_id:
+    if specific_repo_arg or (options is None and prompt_bool("Do you have a specific model to download?", False)):
+        # Collect ONE OR MORE direct repo IDs. The CLI flag --specific-repo
+        # supplies the first; the interactive flow lets the user add more via
+        # a follow-up comma-separated prompt — useful when you've copied a
+        # handful of HF URLs from a tab strip and want to queue them all
+        # without going through the name-search path.
+        repo_ids: list[str] = []
+        first_value = specific_repo_arg or prompt(
+            "Paste Hugging Face repo ID or URL", "")
+        first_repo_id = parse_hf_repo_id(first_value)
+        if not first_repo_id:
             print("Could not parse a Hugging Face repo ID. Use owner/name or a huggingface.co URL.")
             return
+        repo_ids.append(first_repo_id)
+
+        # Ask whether to queue additional repos. Only in interactive mode —
+        # if --specific-repo was passed via CLI, stick to that single one
+        # so scripted invocations behave predictably.
+        if specific_repo_arg is None:
+            extras = prompt(
+                "Do you have more? If so, comma-separate the remaining "
+                "author/model or URL (Enter to skip)",
+                "",
+            ).strip()
+            if extras:
+                for raw in extras.split(","):
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    parsed = parse_hf_repo_id(raw)
+                    if not parsed:
+                        print(f"  ✗ skipping unparseable: {raw!r}")
+                        continue
+                    if parsed in repo_ids:
+                        print(f"  · skipping duplicate: {parsed}")
+                        continue
+                    repo_ids.append(parsed)
+                print(f"Queued {len(repo_ids)} specific repo(s):")
+                for rid in repo_ids:
+                    print(f"  - {rid}")
+
         kind = getattr(options, "specific_kind", None) if options is not None else None
         if kind not in {"model", "dataset"}:
-            kind = prompt_choice("Specific item type", ["model", "dataset"], "model")
-        result = build_exact_hf_result(repo_id, kind=kind)
-        if not result:
+            kind = prompt_choice("Specific item type (applies to all)",
+                                 ["model", "dataset"], "model")
+
+        # Fetch metadata for each. Mark as direct_lookup so the filter chain
+        # doesn't drop any of them on artifact-type/size grounds.
+        results: list[SearchResult] = []
+        for rid in repo_ids:
+            r = build_exact_hf_result(rid, kind=kind)
+            if r is None:
+                print(f"  ✗ direct fetch failed for {rid}")
+                continue
+            r.direct_lookup = True
+            results.append(r)
+        if not results:
+            print("No specific repos could be resolved. Aborting.")
             return
-        annotate_results_with_leaderboard_cache([result])
-        assign_indexes([result])
-        print_results_page([result], 0, 1)
-        selected = paged_select([result], page_size=1)
+        if len(results) < len(repo_ids):
+            print(f"Resolved {len(results)}/{len(repo_ids)} repos; continuing with what worked.")
+
+        annotate_results_with_leaderboard_cache(results)
+        assign_indexes(results)
+        print_results_page(results, 0, len(results))
+        selected = paged_select(results, page_size=max(1, len(results)))
         if not selected:
             print("No selection.")
             return
