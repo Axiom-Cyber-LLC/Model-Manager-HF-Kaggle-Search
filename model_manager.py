@@ -4563,6 +4563,46 @@ def warn_if_incoming_inside_download_root() -> None:
     print()
 
 
+def list_active_downloads_only() -> None:
+    """Read-only listing of the resume queue. No prompts, no side effects.
+    Surfaces every record (after stale-pruning) with size on disk + age.
+    Used by the menu's "List unfinished downloads" option."""
+    records = _prune_stale_active_downloads()
+    print()
+    print("─" * 78)
+    if not records:
+        print("Resume queue is empty.")
+        print(f"  Queue file: {ACTIVE_DOWNLOADS_PATH}")
+        print()
+        return
+    print(f"Resume queue: {len(records)} unfinished download(s)")
+    print(f"  Queue file: {ACTIVE_DOWNLOADS_PATH}")
+    print("─" * 78)
+    for i, rec in enumerate(records, 1):
+        repo = rec.get("repo_id", "?")
+        kind = rec.get("kind", "?")
+        when = rec.get("started_at", "?")
+        downloader = rec.get("downloader", "?")
+        staging = rec.get("staging_path", "")
+        size_str = "(no staging dir)"
+        try:
+            sp = Path(staging)
+            if sp.is_dir():
+                total = sum(p.stat().st_size for p in sp.rglob("*") if p.is_file())
+                size_str = f"{human_size(total)} on disk"
+            elif sp.is_file():
+                size_str = f"{human_size(sp.stat().st_size)} on disk (single file)"
+        except OSError:
+            size_str = "(staging path unreachable)"
+        print(f"  {i}. {repo}")
+        print(f"     kind={kind}  via={downloader}  started={when}  {size_str}")
+        print(f"     staging: {staging}")
+    print()
+    print("To resume any of these: pick \"resume unfinished downloads\" from the main menu,")
+    print(f"or wipe the queue manually with: rm {ACTIVE_DOWNLOADS_PATH}")
+    print()
+
+
 def offer_resume_active_downloads() -> None:
     """Called at the start of run_search_flow. Detects in-flight downloads
     from a prior session, prompts the user, and dispatches the resumes.
@@ -6498,9 +6538,29 @@ def main() -> int:
 
         while True:
             print()
-            choice = prompt_choice("What do you want to do?", ["search/download", "local audit", "leaderboards", "native GUI", "quit"], "search/download")
+            choice = prompt_choice(
+                "What do you want to do?",
+                [
+                    "search/download",
+                    "list unfinished downloads",
+                    "resume unfinished downloads",
+                    "local audit",
+                    "leaderboards",
+                    "native GUI",
+                    "quit",
+                ],
+                "search/download",
+            )
             if choice == "search/download":
                 run_search_flow()
+            elif choice == "list unfinished downloads":
+                list_active_downloads_only()
+            elif choice == "resume unfinished downloads":
+                # offer_resume_active_downloads() prints the queue and prompts
+                # for y/N/q/numeric selection. Returns to the menu after,
+                # rather than dropping into the search-query prompt the way
+                # the search/download flow does.
+                offer_resume_active_downloads()
             elif choice == "local audit":
                 run_local_audit_only()
             elif choice == "leaderboards":
