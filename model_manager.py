@@ -6592,11 +6592,21 @@ def main() -> int:
             elif choice == "list unfinished downloads":
                 list_active_downloads_only()
             elif choice == "resume unfinished downloads":
-                # offer_resume_active_downloads() prints the queue and prompts
-                # for y/N/q/numeric selection. Returns to the menu after,
-                # rather than dropping into the search-query prompt the way
-                # the search/download flow does.
-                offer_resume_active_downloads()
+                # Pre-check queue so the menu gives feedback when empty.
+                # offer_resume_active_downloads() is silent-on-empty by design
+                # (it's called automatically at search-flow start where silence
+                # is correct), but when invoked from the menu the user expects
+                # to know what happened — otherwise picking option 3 just
+                # silently returns to the menu and looks broken.
+                pending = _prune_stale_active_downloads()
+                if not pending:
+                    print()
+                    print("─" * 78)
+                    print("Resume queue is empty — nothing to resume.")
+                    print(f"  Queue file: {ACTIVE_DOWNLOADS_PATH}")
+                    print()
+                else:
+                    offer_resume_active_downloads()
             elif choice == "local audit":
                 run_local_audit_only()
             elif choice == "leaderboards":
