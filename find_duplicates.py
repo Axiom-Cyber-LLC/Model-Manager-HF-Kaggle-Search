@@ -139,9 +139,15 @@ def in_use_blobs(roots: Iterable[Path] | None = None) -> dict[str, list[str]]:
         for manifest in mroot.rglob("*"):
             if not manifest.is_file():
                 continue
+            # Skip dotfiles and obvious junk (.DS_Store, ._foo, etc.)
+            # macOS Finder leaves binary .DS_Store files in any browsed
+            # directory; if treated as JSON they hit UnicodeDecodeError.
+            if manifest.name.startswith(".") or manifest.name.startswith("._"):
+                continue
             try:
                 data = json.loads(manifest.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError):
+                # ValueError covers UnicodeDecodeError and any other parse weirdness
                 continue
             try:
                 tail = manifest.relative_to(mroot).parts
