@@ -163,6 +163,13 @@ DEFAULT_DOWNLOAD_RETRY_BASE_DELAY_SECONDS = 3
 # Override per-session with --large-download-warn-gb or env var
 # MODEL_MANAGER_LARGE_DOWNLOAD_WARN_GB (set to 0 to disable entirely).
 DEFAULT_LARGE_DOWNLOAD_WARN_GB = 85
+# Separate (lower) threshold for datasets. Datasets are notorious for being
+# much larger than expected — single corpus dumps commonly hit 100 GB - 1 TB
+# without obvious naming hints (no "10B" or "70B" in the title to give it
+# away). 50 GB catches "I queued a research corpus that's actually 600 GB"
+# scenarios early. Override per-session with --large-dataset-warn-gb or env
+# var MODEL_MANAGER_LARGE_DATASET_WARN_GB (set to 0 to disable entirely).
+DEFAULT_LARGE_DATASET_WARN_GB = 50
 HFDOWNLOADER_SAFE_FILTER_ARTIFACT_TYPES = {"gguf", "gguf-split", "safetensors", "safetensors-sharded"}
 MULTIPART_ARTIFACT_TYPES = {"gguf-split", "safetensors-sharded"}
 HFDOWNLOADER_MODEL_EXCLUDE_TERMS = [
@@ -4762,10 +4769,15 @@ def download_hf_result(
         allow_patterns=allow_patterns,
         download_root=download_root,
         staging_path=staging_path,
-        downloader=("hfdownloader" if (result.kind == "model" and hfdownloader_enabled()) else "snapshot_download"),
+        # hfdownloader supports BOTH models and datasets (the latter via the
+        # `--dataset` flag inside download_hf_with_hfdownloader). Previously
+        # we gated this on `result.kind == "model"` for no good reason —
+        # datasets benefit from the multipart speed every bit as much, and
+        # often more since they can be 100 GB-1 TB.
+        downloader=("hfdownloader" if hfdownloader_enabled() else "snapshot_download"),
     )
 
-    if result.kind == "model" and hfdownloader_enabled():
+    if hfdownloader_enabled():
         target = download_hf_with_hfdownloader(result, download_root, allow_patterns, artifacts)
         if target is not None:
             _clear_active_download(rec_id)
@@ -5445,31 +5457,45 @@ def predownload_risk_and_completeness_check(
 
     # Large-download warning. Catches "I accidentally selected a kitchen-sink
     # repo" / "whole-repo dispatch had a bug" cases before they spend hours
-    # downloading things you didn't want. Default 85 GB; override per session
-    # with --large-download-warn-gb or env MODEL_MANAGER_LARGE_DOWNLOAD_WARN_GB
-    # (set to 0 to disable). Use the actual selected size (not repo total)
-    # so single-quant picks from huge multi-quant repos don't over-warn.
-    warn_threshold_gb = env_int(
-        "MODEL_MANAGER_LARGE_DOWNLOAD_WARN_GB",
-        DEFAULT_LARGE_DOWNLOAD_WARN_GB,
-        minimum=0,
-    )
+    # downloading things you didn't want. Two thresholds — models default to
+    # 85 GB (large model weights are common, raise the bar), datasets default
+    # to 50 GB (research corpora are notorious for being 100 GB-1 TB without
+    # the size showing up in the name). Override per-session via:
+    #   models:   --large-download-warn-gb / MODEL_MANAGER_LARGE_DOWNLOAD_WARN_GB
+    #   datasets: --large-dataset-warn-gb / MODEL_MANAGER_LARGE_DATASET_WARN_GB
+    # Set the relevant env var to 0 to disable that threshold entirely.
+    # Uses the actual selected size (not repo total) so single-quant picks
+    # from huge multi-quant repos don't over-warn.
+    if result.kind == "dataset":
+        warn_threshold_gb = env_int(
+            "MODEL_MANAGER_LARGE_DATASET_WARN_GB",
+            DEFAULT_LARGE_DATASET_WARN_GB,
+            minimum=0,
+        )
+        threshold_source = "MODEL_MANAGER_LARGE_DATASET_WARN_GB (dataset threshold)"
+    else:
+        warn_threshold_gb = env_int(
+            "MODEL_MANAGER_LARGE_DOWNLOAD_WARN_GB",
+            DEFAULT_LARGE_DOWNLOAD_WARN_GB,
+            minimum=0,
+        )
+        threshold_source = "MODEL_MANAGER_LARGE_DOWNLOAD_WARN_GB (model threshold)"
     size_for_check = expected_size if expected_size > 0 else (result.size_bytes or 0)
     if warn_threshold_gb > 0 and size_for_check > warn_threshold_gb * (1024 ** 3):
+        kind_label = "DATASET" if result.kind == "dataset" else "DOWNLOAD"
         print()
         print("=" * 78)
-        print("LARGE DOWNLOAD WARNING")
+        print(f"LARGE {kind_label} WARNING")
         print("=" * 78)
         print(f"  Selection size: {human_size(size_for_check)}")
-        print(f"  Threshold:      {warn_threshold_gb} GB")
+        print(f"  Threshold:      {warn_threshold_gb} GB ({result.kind})")
         print(f"  Files:          {len(expected) or '?'}")
         print(f"  Selection:      {selected_label}")
         print(f"  Repo:           {result.repo_id}")
         print()
-        print("  This is a large download. It will take significant time and disk space.")
+        print(f"  This is a large {result.kind}. It will take significant time and disk space.")
         print("  Press Enter or `n` to cancel; type `y` to proceed.")
-        print(f"  Adjust threshold via --large-download-warn-gb or env "
-              "MODEL_MANAGER_LARGE_DOWNLOAD_WARN_GB (0 = disable).")
+        print(f"  Adjust threshold via env: {threshold_source} (0 = disable).")
         if not prompt_bool(f"Proceed with {human_size(size_for_check)} download?", False):
             print("  Skipped (large-download cancellation).")
             return False
@@ -5604,7 +5630,16 @@ def download_selected(results: list[SearchResult], download_root_override: Path 
         download_root = download_root_override.expanduser().resolve()
         print(f"Download root: {download_root}")
     else:
-        download_root = Path(prompt("Download root", str(DEFAULT_DOWNLOAD_DIR))).expanduser().resolve()
+        # `n` / `no` / `none` / `skip` / `-` / blank are sentinels meaning
+        # "use the default" — caught a real-world typo where pressing `n`
+        # at this prompt created a literal `./n/` directory full of orphan
+        # partial downloads (15 GB recovery effort).
+        raw = prompt("Download root", str(DEFAULT_DOWNLOAD_DIR)).strip()
+        if not raw or raw.lower() in {"n", "no", "none", "skip", "-"}:
+            download_root = Path(DEFAULT_DOWNLOAD_DIR).expanduser().resolve()
+            print(f"  Using default download root: {download_root}")
+        else:
+            download_root = Path(raw).expanduser().resolve()
     download_root.mkdir(parents=True, exist_ok=True)
     for r in results:
         print()
@@ -6510,9 +6545,20 @@ def main() -> int:
         type=int,
         help=(
             f"Selected-download size (in GB) above which the predownload check "
-            f"requires explicit confirmation. Default {DEFAULT_LARGE_DOWNLOAD_WARN_GB}. "
+            f"requires explicit confirmation FOR MODELS. Default {DEFAULT_LARGE_DOWNLOAD_WARN_GB}. "
             "Set to 0 to disable the warning entirely. Also configurable via env "
             "MODEL_MANAGER_LARGE_DOWNLOAD_WARN_GB."
+        ),
+    )
+    ap.add_argument(
+        "--large-dataset-warn-gb",
+        type=int,
+        help=(
+            f"Selected-download size (in GB) above which the predownload check "
+            f"requires explicit confirmation FOR DATASETS. Default {DEFAULT_LARGE_DATASET_WARN_GB} "
+            "(lower than the model threshold because research corpora are often 100 GB-1 TB "
+            "without name hints). Set to 0 to disable. Also configurable via env "
+            "MODEL_MANAGER_LARGE_DATASET_WARN_GB."
         ),
     )
     ap.add_argument("--search-source", choices=["huggingface", "kaggle", "both"], help="Search source")
@@ -6535,6 +6581,8 @@ def main() -> int:
     # to thread a parameter through five call sites.
     if getattr(args, "large_download_warn_gb", None) is not None:
         os.environ["MODEL_MANAGER_LARGE_DOWNLOAD_WARN_GB"] = str(int(args.large_download_warn_gb))
+    if getattr(args, "large_dataset_warn_gb", None) is not None:
+        os.environ["MODEL_MANAGER_LARGE_DATASET_WARN_GB"] = str(int(args.large_dataset_warn_gb))
     configure_debug_mode(args.debug or DEBUG_ENABLED, args.debug_log or (str(DEBUG_LOG_PATH) if DEBUG_LOG_PATH else None))
     debug_log("main-args", args=vars(args))
     if DEBUG_ENABLED:
