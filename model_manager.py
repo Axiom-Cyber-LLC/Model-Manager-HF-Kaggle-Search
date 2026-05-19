@@ -825,7 +825,30 @@ def read_input(label: str) -> str:
         raise InputAborted from exc
 
 
+# ---------------------------------------------------------------------------
+# Unattended mode — when set, prompt_*/read_input return defaults silently.
+# Enabled by --unattended CLI flag or set_unattended_mode(True). Used for
+# overnight batch downloads where the user pre-vets the queue once via the
+# pre-flight wall, then walks away.
+# ---------------------------------------------------------------------------
+_UNATTENDED_MODE: bool = False
+
+
+def set_unattended_mode(enabled: bool) -> None:
+    global _UNATTENDED_MODE
+    _UNATTENDED_MODE = bool(enabled)
+
+
+def is_unattended_mode() -> bool:
+    return _UNATTENDED_MODE
+
+
 def prompt(label: str, default: str | None = None) -> str:
+    if _UNATTENDED_MODE:
+        # Silent default fall-through, but log it so the unattended session
+        # log shows what was auto-decided.
+        debug_log("unattended-prompt-default", label=label, default=default)
+        return default or ""
     suffix = f" [{default}]" if default is not None else ""
     value = read_input(f"{label}{suffix}: ").strip()
     return value if value else (default or "")
@@ -4055,6 +4078,66 @@ def merge_tree(src: Path, dst: Path) -> None:
         pass
 
 
+def _trees_are_identical_by_size(left: Path, right: Path) -> tuple[bool, str]:
+    """Fast structural comparison of two trees by relative-path + file size.
+
+    Returns (identical, reason).  `identical=True` only when:
+      - both sides have the exact same set of relative file paths
+      - every file at the same relative path has the same byte size
+
+    Skips byte-content / SHA hashing because (a) hfdownloader already
+    verified sizes per file and (b) hashing 100 GB+ trees is prohibitive
+    when the prompt fires interactively.  Set MODEL_MANAGER_STRICT_IDENTITY=1
+    to layer a per-file SHA256 check on top — slow but cryptographic.
+    """
+    def _index(root: Path) -> dict[str, int]:
+        out: dict[str, int] = {}
+        for p in root.rglob("*"):
+            try:
+                if not p.is_file():
+                    continue
+                rel = str(p.relative_to(root))
+                # Ignore platform / tool metadata that legitimately differs
+                if rel.startswith(".") or "/.git/" in f"/{rel}" or rel.endswith(".DS_Store"):
+                    continue
+                out[rel] = p.stat().st_size
+            except OSError:
+                continue
+        return out
+
+    li = _index(left)
+    ri = _index(right)
+    only_left = sorted(set(li) - set(ri))
+    only_right = sorted(set(ri) - set(li))
+    if only_left or only_right:
+        diff_summary = []
+        if only_left:
+            diff_summary.append(f"{len(only_left)} only in staged (e.g. {only_left[0]})")
+        if only_right:
+            diff_summary.append(f"{len(only_right)} only in existing (e.g. {only_right[0]})")
+        return False, "; ".join(diff_summary)
+    size_diffs = [rel for rel in li if li[rel] != ri[rel]]
+    if size_diffs:
+        return False, f"{len(size_diffs)} file(s) differ in size (e.g. {size_diffs[0]})"
+    # Optional cryptographic check
+    if os.environ.get("MODEL_MANAGER_STRICT_IDENTITY", "").strip().lower() in {"1", "yes", "true", "on"}:
+        import hashlib
+        for rel in li:
+            try:
+                h_left = hashlib.sha256(); h_right = hashlib.sha256()
+                with (left / rel).open("rb") as f:
+                    for chunk in iter(lambda: f.read(1 << 20), b""):
+                        h_left.update(chunk)
+                with (right / rel).open("rb") as f:
+                    for chunk in iter(lambda: f.read(1 << 20), b""):
+                        h_right.update(chunk)
+                if h_left.digest() != h_right.digest():
+                    return False, f"sha256 differs: {rel}"
+            except OSError as e:
+                return False, f"hash read failed: {rel}: {e}"
+    return True, f"{len(li)} files; total size match"
+
+
 def promote_staged_download(staged: Path, final: Path) -> Path | None:
     if not staged.exists():
         print(f"Staged download no longer exists; not installing: {staged}")
@@ -4062,6 +4145,23 @@ def promote_staged_download(staged: Path, final: Path) -> Path | None:
     print(f"Staged download passed review: {staged}")
     print(f"Final install path: {final}")
     if final.exists():
+        # Auto-merge fast path: if staged and existing-final compare as
+        # byte-size-identical (same files, same sizes), merging is a no-op
+        # in practice — skip the prompt and just unify. Saves the "Y/n
+        # merge?" interruption on re-runs where modelmgr re-downloaded the
+        # same dataset. Disable with MODEL_MANAGER_AUTO_MERGE_IDENTICAL=0
+        # if you want the prompt back.
+        auto_merge = os.environ.get("MODEL_MANAGER_AUTO_MERGE_IDENTICAL", "1").strip().lower() in {"1", "yes", "true", "on"}
+        if auto_merge:
+            identical, reason = _trees_are_identical_by_size(staged, final)
+            if identical:
+                print(f"Staged and existing trees are identical ({reason}). Auto-merging (no-op).")
+                merge_tree(staged, final)
+                print(f"Installed to: {final}")
+                return final
+            else:
+                print(f"Staged and existing trees differ: {reason}")
+                print("Falling back to interactive merge prompt (set MODEL_MANAGER_AUTO_MERGE_IDENTICAL=0 to always prompt).")
         if not prompt_bool("Final path already exists. Merge staged files into existing final path?", False):
             print("Keeping staged download in place for manual review.")
             return staged
