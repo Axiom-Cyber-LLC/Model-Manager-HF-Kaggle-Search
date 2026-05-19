@@ -4298,13 +4298,30 @@ def download_hf_with_hfdownloader(
         print("Safety excludes for unselected model formats: " + ", ".join(excludes))
     print(f"Running: {quote_cmd(cmd)}")
     attempts = download_retry_attempts()
+    # Capture stderr so we can scan it for permanent-error markers (401/403/
+    # 404, "gated repo", "repository not found", etc.) after a failure.
+    # stdout passes through to the user's terminal so the hfdownloader TUI
+    # progress bars remain visible during the download.
+    stderr_capture_path = staging_download_path(result, download_root).parent / ".hfdownloader.stderr.tmp"
+    stderr_capture_path.parent.mkdir(parents=True, exist_ok=True)
     for attempt in range(1, attempts + 1):
         try:
             if attempt > 1:
                 print(f"Retry attempt {attempt}/{attempts} with hfdownloader. Reusing any partial files already on disk.")
-            subprocess.run(cmd, check=True, env=env)
+            with stderr_capture_path.open("w", encoding="utf-8") as err_fh:
+                subprocess.run(cmd, check=True, env=env, stderr=err_fh)
             break
         except subprocess.CalledProcessError as e:
+            # Read what hfdownloader wrote to stderr so we can both surface it
+            # to the user AND scan for permanent-error markers.
+            try:
+                stderr_text = stderr_capture_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                stderr_text = ""
+            if stderr_text:
+                print("── hfdownloader stderr ──")
+                print(stderr_text.rstrip())
+                print("─────────────────────────")
             debug_log(
                 "hfdownloader-failed",
                 repo_id=result.repo_id,
@@ -4314,12 +4331,48 @@ def download_hf_with_hfdownloader(
                 returncode=e.returncode,
                 attempt=attempt,
                 attempts=attempts,
+                stderr_tail=stderr_text[-500:],
             )
+            # Permanent-error detection: scan stderr for the same markers that
+            # looks_like_permanent_download_error() uses for the snapshot_download
+            # path. Hits like "403 Forbidden", "GatedRepoError", "404 Not Found",
+            # "Authentication required" → no amount of retrying will help.
+            class _PseudoErr(Exception):
+                pass
+            permanent = looks_like_permanent_download_error(_PseudoErr(stderr_text))
+            if permanent:
+                print()
+                print("=" * 78)
+                print("PERMANENT DOWNLOAD ERROR (will NOT retry)")
+                print("=" * 78)
+                print(f"  Repo:  {result.repo_id}")
+                print(f"  Kind:  {result.kind}")
+                print()
+                if "403" in stderr_text or "gated" in stderr_text.lower() or "permission" in stderr_text.lower():
+                    print(f"  Likely cause: repo is GATED. Request access at:")
+                    print(f"    https://huggingface.co/{'datasets/' if result.kind == 'dataset' else ''}{result.repo_id}")
+                elif "404" in stderr_text or "not found" in stderr_text.lower():
+                    print(f"  Likely cause: repo or revision does not exist (deleted, renamed, or typo).")
+                elif "401" in stderr_text or "authentication" in stderr_text.lower() or "invalid token" in stderr_text.lower():
+                    print(f"  Likely cause: HF token is missing/invalid. Run `huggingface-cli login`.")
+                else:
+                    print(f"  See stderr above for details.")
+                print(f"  Falling back to huggingface_hub snapshot_download for the same diagnostic.")
+                print("=" * 78)
+                try:
+                    stderr_capture_path.unlink()
+                except OSError:
+                    pass
+                return None
             if attempt >= attempts:
                 partial_hint = nested if nested.exists() else safe_nested if safe_nested.exists() else target if target.exists() else None
                 if partial_hint is not None:
                     print(f"Partial download remains on disk at {partial_hint}. The next retry or rerun can resume from there.")
                 print(f"hfdownloader failed after {attempts} attempt(s) with rc={e.returncode}. Falling back to huggingface_hub snapshot_download.")
+                try:
+                    stderr_capture_path.unlink()
+                except OSError:
+                    pass
                 return None
             delay = retry_delay_seconds(attempt)
             print(
@@ -4327,6 +4380,11 @@ def download_hf_with_hfdownloader(
                 f"Retrying in {delay}s and resuming from any partial files already downloaded."
             )
             time.sleep(delay)
+    # Clean up the stderr capture file on success
+    try:
+        stderr_capture_path.unlink()
+    except OSError:
+        pass
     if nested.exists():
         return nested
     if safe_nested.exists():
