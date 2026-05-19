@@ -9,7 +9,7 @@ ones. Does NOT use any local state file — the source of truth is
 
 Use this when:
   - You suspect Prepare_models_for_Ollama.py's state file is stale
-  - You did `ollama rm`, switched OLLAMA_MODELS, or rebuilt ~/.ollama/
+  - You did `ollama rm`, switched OLLAMA_MODELS, or rebuilt <REDACTED_PATH>
   - You want to verify "47 cached" actually maps to 47 ollama list entries
 
 Usage:
@@ -29,11 +29,11 @@ from pathlib import Path
 # ── Config (mirrors Prepare_models_for_Ollama.py) ───────────────────
 
 SCAN_ROOTS = [
-    Path("/Volumes/ModelStorage/models"),
-    Path("/Volumes/ModelStorage/models-flat"),
-    Path("/Volumes/ModelStorage/.cache/huggingface"),
+    Path("<Your Model Directory>"),
+    Path("<Your Model Directory>"),
+    Path("<REDACTED_PATH>"),
     Path.home() / ".cache" / "huggingface",
-    Path("/Volumes/ModelStorage/.cache/modelscope"),
+    Path("<Your Model Directory>"),
 ]
 
 # Diffusion/image GGUFs that crash llama.cpp at load time

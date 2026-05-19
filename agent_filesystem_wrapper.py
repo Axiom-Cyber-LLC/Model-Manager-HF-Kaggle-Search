@@ -27,7 +27,7 @@ Usage:
   python agent_filesystem_wrapper.py \
       --endpoint http://localhost:1234/v1 \
       --model "lily-cybersecurity-7b-uncensored" \
-      --root  /Volumes/ModelStorage/projects/scratch \
+      --root  <REDACTED_PATH> \
       --system-prompt _presets/agent_system_prompt.md \
       --task "write a python tcp port scanner to scanner.py"
 

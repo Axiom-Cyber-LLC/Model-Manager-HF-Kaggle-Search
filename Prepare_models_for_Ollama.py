@@ -53,13 +53,10 @@ SCAN_ROOTS = extend_scan_roots([
     Path("<Your Model Directory>/local"),
     Path("<REDACTED_PATH>"),
     Path.home() / ".cache" / "huggingface",   # symlink to the SSDE one
-    Path("<Your Model Directory>"),
     Path("<REDACTED_PATH>"),
     Path.home() / "model_downloads" / "huggingface" / "model",
     Path.home() / "Library" / "Application Support" / "nomic.ai" / "GPT4All",
     Path.home() / ".lmstudio" / "models",
-    Path("<REDACTED_PATH>"),
-    Path("<REDACTED_PATH>"),
 ])
 
 # Kept for the --clean-orphans path; NOT applied during registration anymore

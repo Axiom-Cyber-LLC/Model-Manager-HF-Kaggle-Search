@@ -10,7 +10,7 @@ It reports:
   - largest recent files in allowed directories
 
 It does NOT:
-  - scan /Volumes/ModelStorage as a whole drive
+  - scan <REDACTED_PATH> as a whole drive
   - audit cloud folders
   - delete files
   - quarantine files
@@ -28,12 +28,12 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 
-# Explicit allowlist only. Do not add /Volumes/ModelStorage here.
+# Explicit allowlist only. Do not add <REDACTED_PATH> here.
 SCAN_DIRS = [
-    Path("/Volumes/ModelStorage/models"),
-    Path("/Volumes/ModelStorage/models-flat"),
-    Path("/Volumes/ModelStorage/.cache/huggingface"),
-    Path("/Volumes/ModelStorage/.cache/modelscope"),
+    Path("<Your Model Directory>"),
+    Path("<Your Model Directory>"),
+    Path("<REDACTED_PATH>"),
+    Path("<Your Model Directory>"),
     Path.home() / ".cache" / "huggingface",
 ]
 
@@ -100,7 +100,7 @@ def validate_scan_dirs() -> None:
         forbidden_exact = {
             Path("/"),
             Path("/Volumes"),
-            Path("/Volumes/ModelStorage"),
+            Path("<REDACTED_PATH>"),
             Path.home(),
             Path.home() / "Library",
             Path.home() / "Library" / "CloudStorage",

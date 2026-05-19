@@ -75,7 +75,6 @@ DEFAULT_LOCAL_MODEL_DIRS = [
     Path("<Your Model Directory>"),
     Path("<REDACTED_PATH>"),
     Path.home() / ".cache" / "huggingface",
-    Path("<Your Model Directory>"),
 ]
 
 DEFAULT_SECURITY_TOOLS = [

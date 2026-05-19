@@ -15,7 +15,7 @@ Optional dependencies:
 
 Auth:
   HF_TOKEN or HUGGINGFACEHUB_API_TOKEN for gated/private Hugging Face repos.
-  ~/.kaggle/kaggle.json or KAGGLE_USERNAME/KAGGLE_KEY for Kaggle.
+  <REDACTED_PATH> or KAGGLE_USERNAME/KAGGLE_KEY for Kaggle.
 """
 
 from __future__ import annotations
@@ -41,24 +41,24 @@ from typing import Any, Iterable
 # -----------------------------------------------------------------------------
 
 DEFAULT_LOCAL_MODEL_DIRS = [
-    Path("/Volumes/ModelStorage/models"),
-    Path("/Volumes/ModelStorage/models-flat"),
-    Path("/Volumes/ModelStorage/.cache/huggingface"),
+    Path("<Your Model Directory>"),
+    Path("<Your Model Directory>"),
+    Path("<REDACTED_PATH>"),
     Path.home() / ".cache" / "huggingface",
-    Path("/Volumes/ModelStorage/.cache/modelscope"),
+    Path("<Your Model Directory>"),
 ]
 
 DEFAULT_SECURITY_TOOLS = [
-    Path("~/modelaudit/").expanduser(),
-    Path("~/modelscan").expanduser(),
-    Path("~/modelscan/").expanduser(),
-    Path("~/skillcheck/").expanduser(),
-    Path("~/skill-scanner").expanduser(),
-    Path("~/skill-scanner/").expanduser(),
+    Path("<REDACTED_PATH>").expanduser(),
+    Path("<REDACTED_PATH>").expanduser(),
+    Path("<REDACTED_PATH>").expanduser(),
+    Path("<REDACTED_PATH>").expanduser(),
+    Path("<REDACTED_PATH>").expanduser(),
+    Path("<REDACTED_PATH>").expanduser(),
 ]
 
 PREP_SCRIPT_CANDIDATES = [
-    Path("/Volumes/ModelStorage/models-flat/Prepare_models_for_All.py"),
+    Path("<Your Model Directory>/Prepare_models_for_All.py"),
     Path("./Prepare_models_for_All.py"),
     Path.home() / "Prepare_models_for_All.py",
 ]
@@ -1363,7 +1363,7 @@ def run_search_flow() -> None:
 
 def run_local_audit_only() -> None:
     script_candidates = [
-        Path("/Volumes/ModelStorage/models-flat/model_audit.py"),
+        Path("<Your Model Directory>/model_audit.py"),
         Path("./model_audit.py"),
         Path.home() / "model_audit.py",
     ]

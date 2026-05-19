@@ -44,22 +44,19 @@ DEFAULT_GGUF_ROOTS = extend_scan_roots([
     Path("<Your Model Directory>/local"),
     Path("<REDACTED_PATH>"),
     HOME / ".cache" / "huggingface",   # symlink to the SSDE one
-    Path("<Your Model Directory>"),
     Path("<REDACTED_PATH>"),
     HOME / "model_downloads" / "huggingface" / "model",
     GPT4ALL_DIR,                       # filtered out at runtime — we ARE this dir
     HOME / ".lmstudio" / "models",     # legacy fallback
-    Path("<REDACTED_PATH>"),
-    Path("<REDACTED_PATH>"),
 ])
 GGUF_EXT = ".gguf"
 
 # Directory tokens we never DESCEND into below a scan root. These are
 # tool-internal layouts (HF cache structure, Ollama blob store, LM Studio
 # symlink hashes) that contain symlinks/aliases to blobs we'll already see
-# via their canonical location. The user's `.cache/huggingface` and
-# `.cache/modelscope` are top-level roots, so `.cache` is intentionally
-# NOT in this list — relative-path checks won't include the root prefix.
+# via their canonical location. The user's `.cache/huggingface` (etc.) is a
+# top-level root, so `.cache` is intentionally NOT in this list — the
+# relative-path check at line 109 doesn't include the root prefix.
 SKIP_DIR_NAMES = {
     "blobs", ".locks", "refs",
     ".studio_links", ".git", "__pycache__",
@@ -145,20 +142,54 @@ def iter_ggufs(root: Path):
 
 
 def safe_symlink(src: Path, dst: Path, dry_run: bool) -> str:
-    if dst.is_symlink():
-        current = Path(os.readlink(dst))
-        if current == src.resolve() or current == src:
-            return "exists"
+    """
+    Create a symlink dst -> src.  Robust against:
+      - dangling symlinks (readlink succeeds, exists() False, target gone)
+      - permission glitches on .exists() (rare APFS/network-mount transient)
+      - real-file collisions where dst is a regular file (skip safely)
+      - race where dst gets created between checks
+    Any OSError is converted to a returned "error" status; the caller logs
+    the message rather than letting it propagate and crash the thread pool.
+    """
+    try:
+        if dst.is_symlink():
+            try:
+                current = Path(os.readlink(dst))
+            except OSError as e:
+                return f"error:readlink:{e.strerror or e}"
+            try:
+                src_resolved = src.resolve()
+            except OSError:
+                src_resolved = src
+            if current == src_resolved or current == src:
+                return "exists"
+            if dry_run:
+                return "replace"
+            try:
+                dst.unlink()
+            except OSError as e:
+                return f"error:unlink:{e.strerror or e}"
+        else:
+            try:
+                if dst.exists():
+                    return "skip-real-file"
+            except OSError as e:
+                return f"error:exists:{e.strerror or e}"
         if dry_run:
-            return "replace"
-        dst.unlink()
-    elif dst.exists():
-        return "skip-real-file"
-    if dry_run:
-        return "create"
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    os.symlink(src, dst)
-    return "created"
+            return "create"
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(src, dst)
+        except FileExistsError:
+            # Lost the race — another worker (or the GPT4All app itself)
+            # created dst between our check and the symlink call. Treat as
+            # benign: the on-disk state is now what we wanted.
+            return "exists"
+        except OSError as e:
+            return f"error:symlink:{e.strerror or e}"
+        return "created"
+    except Exception as e:  # last-resort guard so the pool never dies
+        return f"error:unexpected:{type(e).__name__}:{e}"
 
 
 def clean_dangling(root: Path, dry_run: bool) -> int:
@@ -231,7 +262,8 @@ def main():
             print(f"  Created: {args.target}")
 
     # Gather all tasks first (serial walk), then parallelize the symlink ops
-    stats = {"created": 0, "exists": 0, "replace": 0, "skip-real-file": 0}
+    stats = {"created": 0, "exists": 0, "replace": 0, "skip-real-file": 0, "error": 0}
+    error_samples: list[str] = []
     seen_targets = set()
     tasks = []
     for root in source_roots:
@@ -244,17 +276,41 @@ def main():
 
     def _do_one(task):
         src, dst, name = task
-        status = safe_symlink(src, dst, args.dry_run)
+        try:
+            status = safe_symlink(src, dst, args.dry_run)
+        except Exception as e:  # belt-and-braces: pool must never die
+            status = f"error:wrapper:{type(e).__name__}:{e}"
         tag = "[DRY RUN] " if args.dry_run else ""
-        _log(f"  {tag}{status:14s} {name}")
-        return status
+        if status.startswith("error"):
+            _log(f"  {tag}ERROR          {name}  ({status})")
+        else:
+            _log(f"  {tag}{status:14s} {name}")
+        return status, name
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        for status in pool.map(_do_one, tasks):
-            stats[status] = stats.get(status, 0) + 1
+        # Use as_completed so we surface every result even if some fail,
+        # rather than letting pool.map() propagate the first exception.
+        futures = [pool.submit(_do_one, t) for t in tasks]
+        for fut in as_completed(futures):
+            try:
+                status, name = fut.result()
+            except Exception as e:
+                status, name = (f"error:future:{type(e).__name__}:{e}", "<unknown>")
+                _log(f"  ERROR          {name}  ({status})")
+            if status.startswith("error"):
+                stats["error"] += 1
+                if len(error_samples) < 10:
+                    error_samples.append(f"{name}: {status}")
+            else:
+                stats[status] = stats.get(status, 0) + 1
 
     print()
     print(f"Result: {stats}")
+    if stats["error"] and error_samples:
+        print()
+        print(f"  First {len(error_samples)} errors (of {stats['error']}):")
+        for s in error_samples:
+            print(f"    - {s}")
 
     if args.clean:
         print()
@@ -262,9 +318,32 @@ def main():
         removed = clean_dangling(args.target, args.dry_run)
         print(f"  Dangling symlinks removed: {removed}")
 
+    # Heads-up if the app is running — it doesn't prevent symlink creation but
+    # makes index refresh racy and is a common cause of "GPT4All doesn't see
+    # new models" follow-up questions.
+    try:
+        import subprocess as _sp
+        if _sp.run(["pgrep", "-x", "GPT4All"], capture_output=True,
+                   text=True, timeout=2).stdout.strip():
+            print()
+            print("  NOTE: GPT4All is currently running. Quit and reopen it to "
+                  "pick up new symlinks.")
+    except Exception:
+        pass
+
     print()
     print("Done. Restart GPT4All to refresh its model list.")
 
+    # Exit policy: return non-zero ONLY if every task failed (catastrophic),
+    # so a single bad file in 300+ doesn't tank the orchestrator. The detailed
+    # error sample above gives the operator enough to diagnose.
+    total_tasks = sum(stats.values())
+    if total_tasks > 0 and stats.get("error", 0) == total_tasks:
+        print()
+        print(f"  All {total_tasks} tasks failed — returning non-zero.")
+        return 1
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)

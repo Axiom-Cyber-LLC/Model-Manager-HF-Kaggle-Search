@@ -106,12 +106,9 @@ HF_CACHE_DIRS = extend_scan_roots(_hf_cache_dirs_from_env() + [
     Path("<REDACTED_PATH>"),         # post-move location
     Path("<Your Model Directory>/huggingface/model"),
     Path.home() / ".cache" / "huggingface" / "hub",       # symlink fallback
-    Path("<Your Model Directory>"),       # ModelScope cache
     Path("<REDACTED_PATH>"),
     Path.home() / "model_downloads" / "huggingface" / "model",
     Path.home() / "Library" / "Application Support" / "nomic.ai" / "GPT4All",
-    Path("<REDACTED_PATH>"),
-    Path("<REDACTED_PATH>"),
 ])
 # Backward-compat alias — kept for code paths that referenced the singular name.
 HF_CACHE_DIR = HF_CACHE_DIRS[0]

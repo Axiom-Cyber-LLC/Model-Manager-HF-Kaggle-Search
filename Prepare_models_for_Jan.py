@@ -46,13 +46,10 @@ DEFAULT_GGUF_ROOTS = extend_scan_roots([
     Path("<Your Model Directory>/local"),
     Path("<REDACTED_PATH>"),
     HOME / ".cache" / "huggingface",   # symlink to the SSDE one
-    Path("<Your Model Directory>"),
     Path("<REDACTED_PATH>"),
     HOME / "model_downloads" / "huggingface" / "model",
     HOME / "Library" / "Application Support" / "nomic.ai" / "GPT4All",
     HOME / ".lmstudio" / "models",     # legacy fallback
-    Path("<REDACTED_PATH>"),
-    Path("<REDACTED_PATH>"),
 ])
 # MLX roots = unified set + MLX-specific extras
 DEFAULT_MLX_ROOTS = extend_scan_roots([
@@ -62,15 +59,12 @@ DEFAULT_MLX_ROOTS = extend_scan_roots([
     Path("<Your Model Directory>/local"),
     Path("<REDACTED_PATH>"),
     HOME / ".cache" / "huggingface",
-    Path("<Your Model Directory>"),
     Path("<REDACTED_PATH>"),
     HOME / "model_downloads" / "huggingface" / "model",
     HOME / "Library" / "Application Support" / "nomic.ai" / "GPT4All",
     HOME / "mlx-lm",
     HOME / "Library" / "Caches" / "huggingface" / "hub",
     HOME / ".lmstudio" / "models",
-    Path("<REDACTED_PATH>"),
-    Path("<REDACTED_PATH>"),
 ])
 
 # Jan's target directories

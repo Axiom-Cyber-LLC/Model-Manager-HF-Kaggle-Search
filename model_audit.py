@@ -43,11 +43,11 @@ from typing import Iterable
 
 HOME = Path.home()
 DEFAULT_SCAN_ROOTS = [
-    Path("/Volumes/ModelStorage/models"),
-    Path("/Volumes/ModelStorage/models-flat"),
-    Path("/Volumes/ModelStorage/.cache/huggingface"),
+    Path("<Your Model Directory>"),
+    Path("<Your Model Directory>"),
+    Path("<REDACTED_PATH>"),
     HOME / ".cache" / "huggingface",
-    Path("/Volumes/ModelStorage/.cache/modelscope"),
+    Path("<Your Model Directory>"),
 ]
 DEFAULT_APP_DIRS = [
     HOME / "Library" / "Application Support" / "nomic.ai" / "GPT4All",
@@ -55,7 +55,7 @@ DEFAULT_APP_DIRS = [
     HOME / "Library" / "Application Support" / "Jan" / "data" / "mlx" / "models",
     HOME / ".lmstudio" / "models",
 ]
-CANONICAL_KEEP_DIR = Path("/Volumes/ModelStorage/models-flat/local")
+CANONICAL_KEEP_DIR = Path("<Your Model Directory>/local")
 
 GGUF_MAGIC = b"GGUF"
 LFS_SIGNATURE = b"version https://git-lfs.github.com/spec/v1"

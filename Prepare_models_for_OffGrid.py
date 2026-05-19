@@ -14,13 +14,10 @@ DEFAULT_ROOTS = extend_scan_roots([
     Path("<Your Model Directory>/local"),
     Path("<REDACTED_PATH>"),
     HOME / ".cache" / "huggingface",
-    Path("<Your Model Directory>"),
     Path("<REDACTED_PATH>"),
     HOME / "model_downloads" / "huggingface" / "model",
     HOME / "Library" / "Application Support" / "nomic.ai" / "GPT4All",
     HOME / ".lmstudio" / "models",
-    Path("<REDACTED_PATH>"),
-    Path("<REDACTED_PATH>"),
 ])
 SKIP_DIR_NAMES = {"blobs", ".locks", "refs", ".studio_links", ".git", "__pycache__"}
 MIN_GGUF_BYTES = 50 * 1024 * 1024
