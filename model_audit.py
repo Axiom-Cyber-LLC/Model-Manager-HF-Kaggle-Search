@@ -44,10 +44,8 @@ from typing import Iterable
 HOME = Path.home()
 DEFAULT_SCAN_ROOTS = [
     Path("<Your Model Directory>"),
-    Path("<Your Model Directory>"),
     Path("<REDACTED_PATH>"),
     HOME / ".cache" / "huggingface",
-    Path("<Your Model Directory>"),
 ]
 DEFAULT_APP_DIRS = [
     HOME / "Library" / "Application Support" / "nomic.ai" / "GPT4All",

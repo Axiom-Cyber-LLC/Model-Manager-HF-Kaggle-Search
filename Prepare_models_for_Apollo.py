@@ -9,9 +9,7 @@ from prepare_models_env import extend_scan_roots
 HOME = Path.home()
 DEFAULT_ROOTS = extend_scan_roots([
     Path("<Your Model Directory>"),
-    Path("<Your Model Directory>"),
     Path("<Your Model Directory>/huggingface/model"),
-    Path("<Your Model Directory>/local"),
     Path("<REDACTED_PATH>"),
     HOME / ".cache" / "huggingface",
     Path("<REDACTED_PATH>"),

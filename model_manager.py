@@ -72,7 +72,6 @@ for _root in (MODEL_MANAGER_SCRIPT_DIR, MODEL_TOOLS_DIR):
 
 DEFAULT_LOCAL_MODEL_DIRS = [
     Path("<Your Model Directory>"),
-    Path("<Your Model Directory>"),
     Path("<REDACTED_PATH>"),
     Path.home() / ".cache" / "huggingface",
 ]
@@ -90,7 +89,6 @@ DEFAULT_SECURITY_TOOLS = [
 PREP_SCRIPT_CANDIDATES = [
     MODEL_MANAGER_SCRIPT_DIR / "Prepare_models_for_All.py",
     Path.home() / "model_tools" / "Prepare_models_for_All.py",
-    Path("<Your Model Directory>/Prepare_models_for_All.py"),
     Path("./Prepare_models_for_All.py"),
     Path.home() / "Prepare_models_for_All.py",
 ]
@@ -98,7 +96,6 @@ PREP_SCRIPT_CANDIDATES = [
 CONVERSION_SCRIPT_CANDIDATES = [
     MODEL_MANAGER_SCRIPT_DIR / "model_conversion.py",
     Path.home() / "model_tools" / "model_conversion.py",
-    Path("<Your Model Directory>/model_conversion.py"),
     Path("./model_conversion.py"),
     Path.home() / "model_conversion.py",
 ]
@@ -1986,6 +1983,16 @@ def parse_hf_repo_id(value: str) -> str | None:
             return None
     if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", value):
         return value
+    # Tolerate `owner__name` flat-naming convention. The prep scripts in this
+    # repo (Prepare_models_for_*.py, model_manager's own flat install layout)
+    # convert `/` → `__` on disk to keep dirs single-level. Users who copy a
+    # name from a dir listing back into this prompt should not get rejected.
+    # We only convert the FIRST `__` so legal `__` within a name survives
+    # (e.g. `owner/model__v2` round-trips through `owner__model__v2`).
+    if "/" not in value and "__" in value:
+        candidate = value.replace("__", "/", 1)
+        if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", candidate):
+            return candidate
     return None
 
 
@@ -6608,9 +6615,8 @@ def run_search_flow(options: argparse.Namespace | None = None) -> None:
 def run_local_audit_only(dry_run: bool | None = None) -> None:
     script_candidates = [
         MODEL_MANAGER_SCRIPT_DIR / "model_audit.py",
-        Path("<Your Model Directory>/model_audit.py"),
-        Path("./model_audit.py"),
         Path.home() / "model_tools" / "model_audit.py",
+        Path("./model_audit.py"),
         Path.home() / "model_audit.py",
     ]
     script = next((p for p in script_candidates if p.is_file()), None)

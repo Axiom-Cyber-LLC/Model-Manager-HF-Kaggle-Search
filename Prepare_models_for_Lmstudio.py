@@ -78,7 +78,30 @@ KNOWN_PUBLISHERS = {
 # Directories that are LM Studio internals, not model folders
 # `local/` is intentionally NOT here — in the flat-dir layout it's a legitimate
 # pseudo-publisher holding all short-named models.
-INTERNAL_DIRS = {"blobs", "manifests", "src", "Reference", "paper", ".git"}
+#
+# Note (2026-05-19): This set was previously smaller and missed several
+# LM Studio / HF cache internal dirs. The Ollama-registration walker at
+# register_with_ollama() and 4 other publisher-iteration loops use this set,
+# so when `.studio_links/<hash>/<file>.gguf` slipped through the filter, the
+# walker tried to register it as Ollama model name `.studio_links/<hash>` —
+# which Ollama rejects ("invalid model name"). The full union of LM Studio
+# and HF cache internals belongs here; _MIRROR_SKIP_TOPLEVEL (line ~1580)
+# stays redundant for now but should eventually be unified with this set.
+INTERNAL_DIRS = {
+    # Ollama / blob-store internals
+    "blobs", "manifests",
+    # Code / docs that someone might drop in a model root
+    "src", "Reference", "paper", ".git",
+    # LM Studio per-blob hash index + staging
+    ".studio_links", ".incoming",
+    # HF cache layout (refs/, snapshots/, blobs/ are HF Hub's own dirs;
+    # blobs/ is already listed above)
+    "refs", "snapshots",
+    # HF cache parent + sibling cache dirs (in case someone re-nests them)
+    "huggingface", "xet", "dataset", "datasets",
+    # Generic dot-cache root if user nests one under models_dir
+    ".cache",
+}
 
 DEFAULT_MODELS_DIR = default_manager_models_dir(Path("<Your Model Directory>"))
 
@@ -1565,14 +1588,15 @@ def migrate_underscore_flat_dirs(
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Models-flat → LM Studio mirror
+# Manager-view → LM Studio mirror
 #
-# `models_dir` (default: models-flat) is the manager's view, but LM Studio
-# reads from its own `downloadsFolder` (lmstudio_dir). When the two paths
-# differ, publisher/repo/ trees in models_dir are invisible to LM Studio.
-# This mirror walks models_dir, finds publisher/repo/<files> trees that
-# aren't already present in lmstudio_dir, and hardlinks the files in.
-# Same-volume → instant, zero extra disk.
+# `models_dir` is the manager's view of disk (was previously `models-flat`;
+# now typically `<Your Model Directory>` since the flat layout was
+# retired). LM Studio reads from its own `downloadsFolder` (lmstudio_dir).
+# When the two paths differ, publisher/repo/ trees in models_dir are
+# invisible to LM Studio. This mirror walks models_dir, finds
+# publisher/repo/<files> trees that aren't already present in lmstudio_dir,
+# and hardlinks the files in. Same-volume → instant, zero extra disk.
 # ──────────────────────────────────────────────────────────────────────
 
 # Top-level names under models_dir that are NOT publisher dirs and should
@@ -1708,7 +1732,7 @@ def mirror_models_flat_to_lmstudio(
                 results.fixed.append((display, repo_dir, dest_repo))
             except OSError as e:
                 print(f"          ERROR: {e}")
-                results.errors.append((display, f"models-flat mirror failed: {e}"))
+                results.errors.append((display, f"manager-view mirror failed: {e}"))
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -2693,9 +2717,12 @@ def main():
     )
     parser.add_argument(
         "--mirror-models-flat", action=argparse.BooleanOptionalAction, default=True,
-        help="Hardlink publisher/repo/ trees from --input (models-flat) into --lmstudio-dir "
-             "so LM Studio's downloadsFolder sees them. Default: enabled. "
-             "Use --no-mirror-models-flat to skip.",
+        help="Hardlink publisher/repo/ trees from --input (the manager view, "
+             "typically <Your Model Directory>) into --lmstudio-dir so "
+             "LM Studio's downloadsFolder sees them. Default: enabled. "
+             "Use --no-mirror-models-flat to skip. (Flag name retained for "
+             "backward compat — the legacy 'models-flat' layout was retired "
+             "2026-05-19; this now mirrors from whatever --input points at.)",
     )
     parser.add_argument(
         "--migrate-underscore-flat", action=argparse.BooleanOptionalAction, default=True,
@@ -2763,7 +2790,10 @@ def main():
     parser.add_argument(
         "--flatten-output", type=Path,
         default=Path("<Your Model Directory>"),
-        help="Target directory for flattened models (default: <Your Model Directory>).",
+        help="Target directory for flattened models (default: <Your Model Directory> — "
+             "files land under <target>/local/<short-name>/). Previous default was "
+             "<Your Model Directory>; that layout was retired 2026-05-19 "
+             "since LM Studio's downloadsFolder is now the single canonical home.",
     )
     parser.add_argument(
         "--flatten-input", type=Path, action="append", default=[],

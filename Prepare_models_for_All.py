@@ -38,10 +38,12 @@ from pathlib import Path
 
 from prepare_models_env import export_prep_environment
 
-# Find model_audit (it lives next to the prepare scripts)
+# Find model_audit (it lives next to the prepare scripts).
+# Canonical home: <REDACTED_PATH> The orchestrator's own dir is the primary,
+# with <REDACTED_PATH> as a fallback when run via a copy from elsewhere.
 _AUDIT_PATHS = [
-    Path("<Your Model Directory>"),
     Path(__file__).resolve().parent,
+    Path.home() / "model_tools",
 ]
 for _p in _AUDIT_PATHS:
     if (_p / "model_audit.py").is_file() and str(_p) not in sys.path:

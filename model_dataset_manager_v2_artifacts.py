@@ -42,10 +42,8 @@ from typing import Any, Iterable
 
 DEFAULT_LOCAL_MODEL_DIRS = [
     Path("<Your Model Directory>"),
-    Path("<Your Model Directory>"),
     Path("<REDACTED_PATH>"),
     Path.home() / ".cache" / "huggingface",
-    Path("<Your Model Directory>"),
 ]
 
 DEFAULT_SECURITY_TOOLS = [
@@ -58,7 +56,7 @@ DEFAULT_SECURITY_TOOLS = [
 ]
 
 PREP_SCRIPT_CANDIDATES = [
-    Path("<Your Model Directory>/Prepare_models_for_All.py"),
+    Path.home() / "model_tools" / "Prepare_models_for_All.py",
     Path("./Prepare_models_for_All.py"),
     Path.home() / "Prepare_models_for_All.py",
 ]
@@ -1363,7 +1361,7 @@ def run_search_flow() -> None:
 
 def run_local_audit_only() -> None:
     script_candidates = [
-        Path("<Your Model Directory>/model_audit.py"),
+        Path.home() / "model_tools" / "model_audit.py",
         Path("./model_audit.py"),
         Path.home() / "model_audit.py",
     ]

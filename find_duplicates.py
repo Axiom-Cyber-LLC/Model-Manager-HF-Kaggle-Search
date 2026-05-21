@@ -78,7 +78,7 @@ def find_manifest_roots(roots: Iterable[Path]) -> list[Path]:
     Also walks each configured scan root looking for sibling `manifests/`
     directories that contain a `registry.ollama.ai/` (or any registry host)
     subtree — catches secondary stores like <REDACTED_PATH>
-    or <REDACTED_PATH>
+    or any legacy <REDACTED_PATH> that may still exist.
     """
     found: list[Path] = []
     seen: set[Path] = set()
@@ -513,7 +513,8 @@ def main() -> int:
             print("decide which file(s) to remove manually.")
             return 0
     # Aggregate manifests from every Ollama-style store under any root,
-    # not just <REDACTED_PATH> Catches secondary stores like models-flat/manifests/.
+    # not just <REDACTED_PATH> Catches the canonical <REDACTED_PATH>
+    # store and any legacy secondary stores still on disk.
     in_use = in_use_blobs(roots)
 
     if args.min_size:

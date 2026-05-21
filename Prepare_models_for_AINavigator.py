@@ -459,7 +459,7 @@ def discover_local_models(plan_path: Path, flat_models: Path):
     # default fallback list so this script is self-sufficient when no
     # rename-plan exists and no MODEL_MANAGER_DOWNLOAD_* env is set.
     extra_default_roots = [
-        flat_models,                                                   # <Your Model Directory>
+        flat_models,                                                   # FLAT_ROOT/local — canonical bucket for short-named models
         Path("<Your Model Directory>"),                           # LM Studio downloadsFolder
         Path.home() / ".lmstudio" / "models",                          # LM Studio's own hub layout
     ]
@@ -690,8 +690,8 @@ def inject(db: dict, entries: list[dict], dry_run: bool) -> tuple[int, int, int,
         # so if the DB still has them they're stale (from before arch filtering).
         if mid and mid not in valid_ids:
             # Only remove if we previously INJECTED it (has a file with localPath
-            # pointing into <Your Model Directory>). Don't touch
-            # models AI Nav downloaded itself.
+            # pointing into our FLAT_ROOT — <Your Model Directory>). Don't
+            # touch models AI Nav downloaded itself.
             files = m.get("files") or []
             is_ours = any(
                 any(

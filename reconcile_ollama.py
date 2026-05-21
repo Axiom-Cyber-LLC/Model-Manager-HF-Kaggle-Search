@@ -30,10 +30,8 @@ from pathlib import Path
 
 SCAN_ROOTS = [
     Path("<Your Model Directory>"),
-    Path("<Your Model Directory>"),
     Path("<REDACTED_PATH>"),
     Path.home() / ".cache" / "huggingface",
-    Path("<Your Model Directory>"),
 ]
 
 # Diffusion/image GGUFs that crash llama.cpp at load time

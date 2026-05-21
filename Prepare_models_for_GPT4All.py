@@ -39,9 +39,7 @@ GPT4ALL_DIR = HOME / "Library" / "Application Support" / "nomic.ai" / "GPT4All"
 # walking our own destination as a source.
 DEFAULT_GGUF_ROOTS = extend_scan_roots([
     Path("<Your Model Directory>"),
-    Path("<Your Model Directory>"),
     Path("<Your Model Directory>/huggingface/model"),
-    Path("<Your Model Directory>/local"),
     Path("<REDACTED_PATH>"),
     HOME / ".cache" / "huggingface",   # symlink to the SSDE one
     Path("<REDACTED_PATH>"),

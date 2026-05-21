@@ -41,9 +41,7 @@ HOME = Path.home()
 # and deduped at link-creation time by safe_symlink. Missing roots skipped.
 DEFAULT_GGUF_ROOTS = extend_scan_roots([
     Path("<Your Model Directory>"),
-    Path("<Your Model Directory>"),
     Path("<Your Model Directory>/huggingface/model"),
-    Path("<Your Model Directory>/local"),
     Path("<REDACTED_PATH>"),
     HOME / ".cache" / "huggingface",   # symlink to the SSDE one
     Path("<REDACTED_PATH>"),
@@ -54,9 +52,7 @@ DEFAULT_GGUF_ROOTS = extend_scan_roots([
 # MLX roots = unified set + MLX-specific extras
 DEFAULT_MLX_ROOTS = extend_scan_roots([
     Path("<Your Model Directory>"),
-    Path("<Your Model Directory>"),
     Path("<Your Model Directory>/huggingface/model"),
-    Path("<Your Model Directory>/local"),
     Path("<REDACTED_PATH>"),
     HOME / ".cache" / "huggingface",
     Path("<REDACTED_PATH>"),

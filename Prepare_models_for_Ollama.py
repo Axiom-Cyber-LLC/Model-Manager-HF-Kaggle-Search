@@ -2,8 +2,9 @@
 """
 Register the flat-dir models with Ollama (multi-threaded).
 
-For every GGUF in <Your Model Directory>/local/{short}/ that is
-actually a text-generation model (not an image/video diffusion GGUF), this
+For every GGUF in <Your Model Directory>/local/{short}/ (and other
+scan roots) that is actually a text-generation model (not an image/video
+diffusion GGUF), this
 script creates a Modelfile and runs `ollama create` under a threaded pool.
 
 Image/video diffusion GGUFs (Flux, SDXL, Z-Image, Pixelwave, Wan, Qwen-
@@ -48,9 +49,7 @@ STATE_FILE = HOME / ".ollama" / "models" / "ai_model_state.json"
 # double-register the same blob. Missing roots are skipped silently.
 SCAN_ROOTS = extend_scan_roots([
     Path("<Your Model Directory>"),
-    Path("<Your Model Directory>"),
     Path("<Your Model Directory>/huggingface/model"),
-    Path("<Your Model Directory>/local"),
     Path("<REDACTED_PATH>"),
     Path.home() / ".cache" / "huggingface",   # symlink to the SSDE one
     Path("<REDACTED_PATH>"),
@@ -310,8 +309,8 @@ def detect_ollama_storage_mismatch() -> dict:
 
     hint = None
     if not blobs_ok:
-        # Look for a real blobs dir nearby (common pattern: <REDACTED_PATH> when
-        # daemon points at <REDACTED_PATH>). Probe common siblings.
+        # Look for a real blobs dir nearby (common pattern: <REDACTED_PATH>
+        # when daemon points elsewhere). Probe common siblings.
         for candidate in [
             Path("<Your Model Directory>"),
             Path.home() / ".ollama" / "models",

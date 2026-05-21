@@ -39,8 +39,8 @@ from pathlib import Path
 # model_audit lives next to this script's intended home; until everything is in
 # one tree, fall back to the SamsungSSDE copy.
 _AUDIT_PATHS = [
-    Path("<Your Model Directory>"),
     Path(__file__).resolve().parent,
+    Path.home() / "model_tools",
 ]
 for _p in _AUDIT_PATHS:
     if (_p / "model_audit.py").is_file() and str(_p) not in sys.path:
@@ -59,10 +59,8 @@ except ImportError as e:
 HOME = Path.home()
 DEFAULT_SCAN_ROOTS = [
     Path("<Your Model Directory>"),
-    Path("<Your Model Directory>"),
     Path("<REDACTED_PATH>"),
     HOME / ".cache" / "huggingface",
-    Path("<Your Model Directory>"),
 ]
 DEFAULT_QUANT = "Q8_0"  # was Q4_K_M; Q8_0 is the safe default for LLM eval quality.
 DEFAULT_OUT_DTYPE = "f16"  # convert_hf_to_gguf.py outtype before quantizing
@@ -554,7 +552,7 @@ def main() -> int:
                          "sentence-transformer, or unknown architecture. Default behavior is "
                          "to ask interactively; this flag forces 'include all'.")
     ap.add_argument("--orchestrator",
-                    default="<Your Model Directory>/Prepare_models_for_All.py",
+                    default=str(Path.home() / "model_tools" / "Prepare_models_for_All.py"),
                     help="Path to orchestrator (used by the post-conversion register prompt)")
     args = ap.parse_args()
 
