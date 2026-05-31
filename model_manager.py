@@ -13,8 +13,8 @@ for search or Hub download; they run only when you opt in or pass flags that tri
 Core design:
   - Repos are search results.
   - Downloadable model artifacts inside a repo are discovered and selected separately.
-  - Downloads are read-only/audit-only by default.
-  - Destructive action is never automatic; deletion is offered only after DANGER/BLOCKER findings.
+  - Security/risk checks are report-only and never delete, quarantine, chmod,
+    rename, move aside, or block a user-selected download.
 
 Optional dependencies:
   python3 -m pip install --upgrade huggingface_hub datasets kaggle kagglehub pandas pyarrow safetensors
@@ -42,9 +42,26 @@ import tempfile
 import time
 import traceback
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Iterable
+
+# -----------------------------------------------------------------------------
+# Dead-CWD guard
+# -----------------------------------------------------------------------------
+# If the directory this process was launched from has been deleted or unmounted,
+# os.getcwd() raises OSError ("Operation not permitted" / "No such file or
+# directory"). Several dependencies — notably `rich`, pulled in transitively by
+# huggingface_hub -> httpx — call os.getcwd() at *import* time and crash the
+# whole tool before any work starts. Recover into a known-good directory.
+# NOTE: avoid os.path.abspath()/Path.resolve() in the except branch — they call
+# getcwd() for relative paths and would re-raise the very error we're handling.
+try:
+    os.getcwd()
+except OSError:
+    _safe_dir = os.path.dirname(__file__)
+    os.chdir(_safe_dir if os.path.isabs(_safe_dir) else os.path.expanduser("~"))
+    del _safe_dir
 
 # -----------------------------------------------------------------------------
 # Defaults
@@ -212,11 +229,73 @@ DEFAULT_KNOWN_GOOD_OWNERS = {
     "unsloth", "bartowski", "lmstudio-community", "ggml-org", "mlx-community",
 }
 DEFAULT_WARN_NAME_TERMS = {
-    "uncensored", "unsensored", "abliterated", "obliterated", "jailbreak",
+    # Alignment/content terms are intentionally NOT listed here. uncensored /
+    # abliterated / jailbreak / nsfw / roleplay / erotic etc. are legitimate
+    # models the user keeps on purpose and must NEVER be warned, gated, or hidden
+    # on alignment grounds. Only genuine supply-chain / model-integrity risks belong.
     "backdoor", "backdoored", "poisoned", "eval-bypass", "bypass",
 }
 DEFAULT_EXCLUDED_AUTHORS: list[str] = []
-DEFAULT_EXCLUDED_TERMS = ["uncensored", "nsfw", "roleplay", "erotic", "jailbreak"]
+# Default name/tag exclusions — shown in the "Terms/tags NOT filter" prompt each
+# run (press Enter to apply, type "none" to disable, or edit inline). Applied as a
+# real, hideable filter (case-insensitive substring match on name/tags).
+# Deliberately does NOT include uncensored/abliterated/jailbreak: those stay fully
+# visible (ungated models are valid targets, e.g. for safety research). roleplay/
+# erotic are excluded as low-signal by default. Fully overridable per run — an
+# explicit, user-chosen filter, NOT alignment gating.
+DEFAULT_EXCLUDED_TERMS: list[str] = ["roleplay", "erotic"]
+
+# Hard guard: terms that describe UNGATED / guardrail-free models. These must
+# NEVER trigger a warning, danger flag, or any gating — such models are valid
+# targets (e.g. for safety research) and are kept fully visible.
+# Subtracted from every name-term warn check, so no config file (current,
+# regenerated, or hand-edited) and no future edit to a term list can re-introduce
+# an "ungated model" warning. Genuine tampering terms (backdoor/poisoned/eval-bypass)
+# are deliberately NOT here — those remain real supply-chain warnings.
+NEVER_WARN_TERMS = frozenset({
+    "uncensored", "unsensored", "uncensor", "decensored", "decensor",
+    "abliterated", "abliteration", "obliterated",
+    "jailbreak", "jailbroken",
+    "unfiltered", "unaligned", "unrestricted", "ungated",
+})
+
+# Reputable author/publisher trust tiers — a RANKING BOOST ONLY.
+#   * Tier 1 (official model creators) rank highest, then 2 (framework mirrors),
+#     3 (research orgs), 4 (trusted community quantizers/fine-tuners).
+#   * Within a tier the normal ranking still applies.
+#   * Everyone else stays VISIBLE and ranks normally below — nobody is hidden,
+#     blocked, suppressed, or filtered. Priority only changes sort order.
+#   * A boost NEVER overrides license, provenance, model-card quality, or user
+#     authority. Every applied boost is logged (see apply_priority_sort).
+# Exact org/handle strings only — no fuzzy aliases. Edit freely.
+# Format:  "owner_slug_lowercase": (tier, "trust reason")
+PRIORITY_AUTHORS: dict[str, tuple[int, str]] = {
+    # Tier 1 — official org of the model creator (production / commercial baselines)
+    "google":                (1, "official model creator (Gemma, current Google families)"),
+    "google-deepmind":       (1, "official model creator (Google DeepMind)"),
+    "meta-llama":            (1, "official model creator (Llama / Llama Guard / Prompt Guard)"),
+    "facebook":              (1, "official Meta research org (wav2vec2, BART, DINO)"),
+    "microsoft":             (1, "official model creator (Phi, DeBERTa)"),
+    "mistralai":             (1, "official model creator (Mistral)"),
+    "qwen":                  (1, "official model creator (Qwen LLMs)"),
+    "alibaba-nlp":           (1, "official Alibaba NLP org (GTE embeddings / retrieval)"),
+    "nvidia":                (1, "official model creator (Nemotron, embeddings, safety)"),
+    "ibm-granite":           (1, "official model creator (Granite enterprise models)"),
+    "apple":                 (1, "official model creator (OpenELM on-device)"),
+    "sentence-transformers": (1, "official creator of MiniLM / mpnet embeddings"),
+    # Tier 2 — official framework mirror (reputable; must NOT outrank current model orgs)
+    "keras":                 (2, "official Keras framework mirror"),
+    "tensorflow":            (2, "official TensorFlow framework mirror"),
+    # Tier 3 — reputable research org / university
+    "huggingfaceh4":         (3, "Hugging Face H4 research/alignment org (Zephyr, eval-style releases)"),
+    #   (other research orgs e.g. allenai / eleutherai / bigscience can be added here)
+    # Tier 4 — trusted community quantizers / fine-tuners (raises trust one level only)
+    "bartowski":             (4, "trusted community GGUF/EXL2 quantizer/repackager"),
+    "thebloke":              (4, "trusted community GGUF/GPTQ/AWQ quantizer/repackager"),
+    "mradermacher":          (4, "trusted community GGUF quantizer/repackager"),
+    "jondurbin":             (4, "trusted community fine-tuner / dataset / model author"),
+    "ggerganov":             (4, "trusted inference-ecosystem author (GGUF/llama.cpp), not primarily a model publisher"),
+}
 MODEL_NAME_QUERY_TOKEN_RE = re.compile(r"[A-Za-z]{2,}[A-Za-z0-9._-]*\d[A-Za-z0-9._-]*")
 MAX_MODEL_NAME_TOKEN_VARIANTS = 12
 MODEL_MANAGER_VERSION = "v1.8.1-staged-cart-scan-fix"
@@ -492,6 +571,149 @@ def parse_model_size_range_or_default(value: str | None) -> tuple[int | None, in
     else:
         print(f"Model size filter: {human_size(lo)} - {human_size(hi)}")
     return parsed
+
+
+def prompt_quantization_filter() -> str | None:
+    """Ask the user for a GGUF-style quantization filter (Q4_K_M, Q8_0, etc.).
+
+    Returns the filter string, or None if the user wants no filter. The match
+    is a case-insensitive substring against artifact.quant, artifact.label,
+    and artifact filenames — so 'Q4' matches Q4_0 / Q4_K_M / Q4_K_S, while
+    'Q4_K_M' matches only Q4_K_M variants.
+    """
+    print()
+    print("Filter results to a specific quantization?")
+    print("Examples: Q4_K_M | Q5_K_M | Q8_0 | IQ4_XS | Q4   (substring, case-insensitive)")
+    print("Enter to skip (no quant filter).")
+    value = prompt("Quantization filter", "").strip()
+    if not value:
+        print("Quant filter: any")
+        return None
+    print(f"Quant filter: {value}")
+    return value
+
+
+def parse_quantization_filter_or_default(value: str | None) -> str | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    if not stripped or stripped.lower() in {"any", "all", "*"}:
+        print("Quant filter: any")
+        return None
+    print(f"Quant filter: {stripped}")
+    return stripped
+
+
+def parse_updated_after(value: str | None) -> "datetime | str | None":
+    """Parse a free-form 'updated after' input into a UTC cutoff datetime.
+
+    Accepts:
+      - None / '' / 'any' / 'all' / '*'  → returns None (no filter)
+      - 'today' / 'yesterday'             → start of that day in UTC
+      - '30d' / '6w' / '6m' / '1y'        → that-many days/weeks/months/years ago
+      - 'YYYY-MM-DD' / 'YYYY/MM/DD'       → that date 00:00 UTC
+      - 'MM/DD/YYYY' / 'DD-MM-YYYY'       → tolerated alt formats
+
+    Returns:
+      - datetime (UTC) on success
+      - None when the user explicitly chose 'any'
+      - string 'invalid' when the input couldn't be parsed (caller re-prompts)
+    """
+    if value is None:
+        return None
+    v = value.strip().lower()
+    if not v or v in {"any", "all", "*", "0", "none"}:
+        return None
+    now = datetime.now(timezone.utc)
+    if v == "today":
+        return now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if v == "yesterday":
+        return (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    m = re.fullmatch(r"(\d+)\s*([dwmy])", v)
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2)
+        days = {"d": 1, "w": 7, "m": 30, "y": 365}[unit] * n
+        return (now - timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%d-%m-%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(v, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return "invalid"
+
+
+def prompt_updated_after_date() -> "datetime | None":
+    """Interactive prompt for 'show me models/datasets updated after X'."""
+    print()
+    print("Which date forward do you want to search? (filter by lastModified)")
+    print("Examples: 30d (last 30 days) | 6w | 6m | 1y | 2026-01-01 | any")
+    default = "any"
+    while True:
+        value = prompt("Updated after", default)
+        parsed = parse_updated_after(value)
+        if parsed == "invalid":
+            print("  Invalid date. Use relative (30d/6w/6m/1y) or absolute (YYYY-MM-DD), or 'any'.")
+            continue
+        if parsed is None:
+            print("  Updated-after filter: any")
+        else:
+            print(f"  Updated-after filter: on or after {parsed.date().isoformat()} UTC")
+        return parsed
+
+
+def parse_updated_after_or_default(value: str | None) -> "datetime | None":
+    """CLI wrapper around parse_updated_after — returns None on invalid (with warning)."""
+    if value is None:
+        return None
+    parsed = parse_updated_after(value)
+    if parsed == "invalid":
+        print(f"Invalid --updated-after value: {value!r}. Ignoring (no filter applied).")
+        return None
+    if parsed is None:
+        print("Updated-after filter: any")
+    else:
+        print(f"Updated-after filter (from CLI): on or after {parsed.date().isoformat()} UTC")
+    return parsed
+
+
+def filter_results_by_updated_after(
+    results: list["SearchResult"],
+    cutoff: "datetime | None",
+) -> list["SearchResult"]:
+    """Drop results whose `updated` (lastModified) is older than `cutoff`.
+
+    Behavior:
+      - cutoff=None → no-op (return as-is)
+      - r.direct_lookup=True → always kept (user explicitly asked for this repo)
+      - r.updated missing/unparseable → KEPT (don't penalize unknown — typical of Kaggle results)
+      - r.updated >= cutoff → kept; older → dropped
+    """
+    if cutoff is None:
+        return results
+    kept: list[SearchResult] = []
+    removed = 0
+    for r in results:
+        if r.direct_lookup:
+            kept.append(r)
+            continue
+        if not r.updated:
+            kept.append(r)
+            continue
+        try:
+            s = r.updated.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            if dt >= cutoff:
+                kept.append(r)
+            else:
+                removed += 1
+        except (ValueError, TypeError):
+            kept.append(r)
+    if removed:
+        print(f"  Date filter: removed {removed} result(s) updated before {cutoff.date().isoformat()}")
+    return kept
 
 
 def multipart_artifact_filter_relevant(selected_types: set[str]) -> bool:
@@ -1511,13 +1733,19 @@ def parse_existing_dirs_value(value: str | None) -> list[Path]:
 
 
 def prompt_existing_dirs() -> list[Path]:
-    """Ask the user once per search for directories whose contents should be
-    excluded from results. Returns [] if the user skips. Default order of
-    precedence:
+    """Ask whether to hide already-downloaded repos, and if so from which
+    directories. OPT-IN, default NO — returns [] (nothing hidden) unless the
+    user explicitly enables it. Directory precedence when enabled:
       1. MODEL_MANAGER_EXISTING_DIRS env var (explicit user override)
-      2. DEFAULT_DOWNLOAD_DIR (almost everyone wants to exclude things
-         already sitting in their main downloads root)
+      2. DEFAULT_DOWNLOAD_DIR (your main downloads root)
     """
+    # Default OFF — everything stays visible unless you opt in here.
+    if is_unattended_mode():
+        return []
+    if not prompt_bool(
+            "Hide models you already have? (scan your download dir(s) and drop "
+            "already-downloaded repos from the results)", False):
+        return []
     default = os.environ.get("MODEL_MANAGER_EXISTING_DIRS", "").strip()
     default_source = "env" if default else None
     if not default and DEFAULT_DOWNLOAD_DIR.exists() and DEFAULT_DOWNLOAD_DIR.is_dir():
@@ -1564,6 +1792,10 @@ def apply_existing_repo_exclusions(
 
 
 def choose_artifact_type_filters() -> set[str]:
+    if is_unattended_mode():
+        # Unattended never hides artifact types — include ALL (safetensors/pytorch/onnx
+        # too, which you need for the MLX/Core ML/ONNX convert pipeline). Empty = no filter.
+        return set()
     print()
     print("What model artifact types do you want to search for?")
     print("Choose the types to include. Anything not selected is excluded automatically.")
@@ -1747,6 +1979,69 @@ def filter_results_by_model_size(
         print(f"Filtered out {removed} model repo(s) outside size range: {human_size(lo)} - {human_size(hi)}")
     # Direct lookups were set aside above; re-attach them at the end so they
     # appear alongside the search-driven results.
+    if direct:
+        kept.extend(direct)
+    return kept
+
+
+def filter_results_by_quantization(
+    results: list[SearchResult],
+    quant_filter: str | None,
+) -> list[SearchResult]:
+    """Filter model results to those with at least one artifact whose quant
+    tag, label, or filename contains `quant_filter` (case-insensitive
+    substring). Direct repo lookups are bypassed.
+
+    When a result survives, its visible_artifacts are narrowed to just the
+    matching artifacts — so the picker only offers the relevant quant
+    variant, even if the repo contains many quants.
+    """
+    if not quant_filter:
+        return results
+    needle = quant_filter.strip().lower()
+    if not needle:
+        return results
+    direct = [r for r in results if r.direct_lookup]
+    if direct:
+        results = [r for r in results if not r.direct_lookup]
+        for r in direct:
+            r.notes.append(f"direct repo lookup kept despite quant filter ({quant_filter})")
+    kept: list[SearchResult] = []
+    removed = 0
+    for r in results:
+        if r.kind != "model":
+            kept.append(r)
+            continue
+        if r.source == "hf":
+            refresh_hf_file_metadata(r)
+        artifacts = artifacts_for_display(r)
+        if not artifacts:
+            # Fall back to repo-id substring if we have no artifact info.
+            if needle in r.repo_id.lower():
+                kept.append(r)
+            else:
+                removed += 1
+            continue
+        matching: list[Artifact] = []
+        for a in artifacts:
+            if a.quant and needle in a.quant.lower():
+                matching.append(a)
+                continue
+            if needle in (a.label or "").lower():
+                matching.append(a)
+                continue
+            if any(needle in Path(name).name.lower() for name, _ in a.files):
+                matching.append(a)
+        if matching:
+            apply_visible_artifacts(r, matching)
+            r.notes.append(
+                f"quant match: {quant_filter} ({len(matching)} artifact option(s))"
+            )
+            kept.append(r)
+        else:
+            removed += 1
+    if removed:
+        print(f"Filtered out {removed} model repo(s) without quant matching: {quant_filter}")
     if direct:
         kept.extend(direct)
     return kept
@@ -2719,6 +3014,65 @@ def owner_of(repo_id: str) -> str:
     return repo_id.split("/", 1)[0].lower() if "/" in repo_id else repo_id.lower()
 
 
+def author_trust_tier(repo_id: str) -> int:
+    """Trust tier for the repo's owner: 1 (highest) .. 4, or 5 for everyone else."""
+    info = PRIORITY_AUTHORS.get(owner_of(repo_id))
+    return info[0] if info else 5
+
+
+def priority_boost_record(result: "SearchResult") -> dict | None:
+    """Structured, logged record of a priority ranking boost — or None if the
+    author is not on the priority list. The boost is SORT-ORDER ONLY: it never
+    hides the result, and it never clears the base-model license/provenance
+    obligation (a trusted quantizer's repo license != the base model's)."""
+    info = PRIORITY_AUTHORS.get(owner_of(result.repo_id))
+    if not info:
+        return None
+    tier, reason = info
+    declared = (getattr(result, "license", None) or "").strip()
+    # Author trust can RAISE rank but never overrides license/provenance review.
+    # Tier 4 = repackagers/quantizers/fine-tuners → base-model terms always apply.
+    if tier == 4 or not declared:
+        license_status = "needs_review"
+    else:
+        license_status = f"declared:{declared} (verify provenance)"
+    return {
+        "author": owner_of(result.repo_id),
+        "repo_id": result.repo_id,
+        "trust_tier": tier,
+        "trust_reason": reason,
+        "base_model_license_status": license_status,
+        "ranking_boost_applied": True,
+        "hidden": False,
+    }
+
+
+def apply_priority_sort(results: list["SearchResult"]) -> list["SearchResult"]:
+    """Sort by author trust tier FIRST (the boost), then the normal ranking
+    (leaderboard rank → recommendation → downloads → size). Re-orders in place
+    and returns the same list. NEVER drops, hides, or filters any result; every
+    applied boost is logged so the re-ordering is fully visible."""
+    before = len(results)
+    results.sort(key=lambda r: (
+        author_trust_tier(r.repo_id),
+        r.leaderboard_rank is None,
+        r.leaderboard_rank or 10**9,
+        r.recommendation not in {"KnownGood", "KnownGood/DF", "Leaderboard"},
+        -(r.downloads or 0),
+        -(r.size_bytes or 0),
+    ))
+    boosts = [rec for r in results if (rec := priority_boost_record(r)) is not None]
+    if boosts:
+        by_tier: dict[int, int] = {}
+        for rec in boosts:
+            by_tier[rec["trust_tier"]] = by_tier.get(rec["trust_tier"], 0) + 1
+            debug_log("priority-boost", **rec)   # full structured record per boost
+        summary = ", ".join(f"tier{t}:{by_tier[t]}" for t in sorted(by_tier))
+        print(f"Priority ranking boost applied to {len(boosts)}/{before} result(s) "
+              f"({summary}) — sort order only; nobody hidden, blocked, or filtered.")
+    return results
+
+
 def normalize_owner_name(value: Any) -> str:
     text = str(value).strip().strip("\"'").lower()
     if not text:
@@ -2930,7 +3284,9 @@ def annotate_recommendations(results: list[SearchResult]) -> None:
     good = reputation["known_good_owners"]
     bad = reputation["known_malicious_owners"]
     warn_owners = reputation["warn_owners"]
-    warn_terms = {str(x).lower() for x in cfg.get("warn_name_terms", [])}
+    # Drop any ungated-model terms — they must never produce a warning, even if a
+    # stale or hand-edited config still lists them (see NEVER_WARN_TERMS).
+    warn_terms = {str(x).lower() for x in cfg.get("warn_name_terms", [])} - NEVER_WARN_TERMS
 
     groups: dict[str, list[SearchResult]] = {}
     for r in results:
@@ -3172,8 +3528,15 @@ def show_artifact_picker_for_repo(result: SearchResult) -> bool:
         print(f"Repo {result.index}: {result.repo_id} has no discovered direct model artifacts from file metadata.")
         print("Whole-repository fallback is disabled by default for HF model searches to avoid pulling full repos by accident.")
         return prompt_bool("Select whole repository anyway?", False)
+    # Fast-skip prompt: surface a "Do you want to skip this repo?" question
+    # BEFORE printing the full artifact table. Default is N (continue to picker),
+    # so the normal flow is one extra Enter. Useful for huge multi-GB repos
+    # where the user wants to bail without scrolling the artifact list.
     print()
-    print(f"Repo {result.index}: {result.repo_id}")
+    print(f"Repo {result.index}: {result.repo_id}  ({result_size_label(result)})")
+    if prompt_bool(f"Skip repo {result.index} ({result.repo_id})?", False):
+        print(f"Skipped repo {result.index}.")
+        return False
     print(f"Discovered {len(artifacts)} downloadable artifact(s).")
     print(f"{'#':>4}  {'SIZE':>12}  {'TYPE':<22}  {'QUANT':<10}  ARTIFACT")
     print("-" * 100)
@@ -3225,13 +3588,21 @@ def print_results_page(
     rec_width = 18
     print()
     print(f"Results {start + 1}-{end} of {len(results)}")
-    print(f"{'#':>4}  {'SRC':<7}  {'KIND':<7}  {'FAMILY':<18}  {'LB':<16}  {'REC':<{rec_width}}  {'SIZE':>12}  {'DL':>10}  {'LIKES':>7}  {'TYPE':<22}  {'LICENSE':<14}  REPO")
-    print("-" * 192)
+    print(f"{'#':>4}  {'SRC':<7}  {'KIND':<7}  {'FAMILY':<18}  {'LB':<16}  {'REC':<{rec_width}}  {'SIZE':>12}  {'DL':>10}  {'LIKES':>7}  {'UPDATED':<10}  {'TYPE':<22}  {'LICENSE':<14}  REPO")
+    print("-" * 204)
     for r in results[start:end]:
         lb = r.leaderboard_label or "-"
         rec = r.recommendation or "-"
         fam = model_family_key(r.repo_id) if r.kind == "model" else "-"
-        print(f"{r.index:>4}  {r.source:<7}  {r.kind:<7}  {fam:<18.18}  {lb:<16.16}  {rec:<{rec_width}.{rec_width}}  {result_size_label(r):>12}  {str(r.downloads if r.downloads is not None else '-'):>10}  {str(r.likes if r.likes is not None else '-'):>7}  {(r.pipeline or '-'):<22.22}  {(r.license or '-'):<14.14}  {r.repo_id}")
+        # Compact YYYY-MM-DD from r.updated (ISO 8601), or '-' if missing/unparseable
+        upd = "-"
+        if r.updated:
+            try:
+                s = r.updated.replace("Z", "+00:00")
+                upd = datetime.fromisoformat(s).date().isoformat()
+            except (ValueError, TypeError):
+                upd = r.updated[:10] if len(r.updated) >= 10 else "-"
+        print(f"{r.index:>4}  {r.source:<7}  {r.kind:<7}  {fam:<18.18}  {lb:<16.16}  {rec:<{rec_width}.{rec_width}}  {result_size_label(r):>12}  {str(r.downloads if r.downloads is not None else '-'):>10}  {str(r.likes if r.likes is not None else '-'):>7}  {upd:<10}  {(r.pipeline or '-'):<22.22}  {(r.license or '-'):<14.14}  {r.repo_id}")
         if r.title:
             print(f"      title: {r.title}")
         if r.notes:
@@ -3711,39 +4082,6 @@ def print_findings(findings: list[dict[str, str]]) -> None:
         print(f"  [{f['severity']}] {f['message']}")
 
 
-def should_offer_delete(findings: list[dict[str, str]]) -> tuple[bool, str]:
-    serious = [f["message"] for f in findings if f.get("severity") in {"DANGER", "BLOCKER"}]
-    if not serious:
-        return False, ""
-    return True, "; ".join(serious[:5])
-
-
-def delete_path_after_confirmation(path: Path, reason: str) -> bool:
-    path = path.expanduser().resolve()
-    if not path.exists():
-        print(f"Nothing to delete; path does not exist: {path}")
-        return False
-    print()
-    print("Potentially harmful or invalid download detected.")
-    print(f"Path: {path}")
-    print(f"Reason: {reason}")
-    print("Deletion is permanent for normal filesystem use.")
-    confirm = read_input("Delete this downloaded item? [y/N]: ").strip().lower()
-    if confirm not in {"y", "yes"}:
-        print("Keeping files.")
-        return False
-    if path.is_file() or path.is_symlink():
-        path.unlink()
-        print(f"Deleted file: {path}")
-        return True
-    if path.is_dir():
-        shutil.rmtree(path)
-        print(f"Deleted directory: {path}")
-        return True
-    print(f"Unsupported path type, not deleted: {path}")
-    return False
-
-
 def _venv_python(path: Path) -> Path | None:
     py = path / ".venv" / "bin" / "python"
     if py.is_file() and os.access(py, os.X_OK):
@@ -4001,6 +4339,46 @@ def run_external_security_tools(target: Path) -> list[dict[str, str]]:
 # -----------------------------------------------------------------------------
 
 
+def download_root_is_safe(download_root: Path) -> tuple[bool, str]:
+    """Boot-disk guard. Downloads must land on a *mounted external volume*
+    (/Volumes/<name>/...). Prevents a mis-set MODEL_MANAGER_DOWNLOAD_DIR or an
+    unmounted SSD from silently filling the boot drive — which is how models
+    ended up under <REDACTED_PATH> and <REDACTED_PATH> Returns
+    (ok, reason). Override with MODEL_MANAGER_ALLOW_BOOT_DISK=1."""
+    if os.environ.get("MODEL_MANAGER_ALLOW_BOOT_DISK", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return True, "boot-disk guard disabled (MODEL_MANAGER_ALLOW_BOOT_DISK)"
+    try:
+        root = Path(download_root).expanduser().resolve()
+    except OSError as e:
+        return False, f"could not resolve download root {download_root!r}: {e}"
+    parts = root.parts
+    if len(parts) < 3 or parts[1] != "Volumes":
+        return False, f"target is on the boot disk, not an external volume: {root}"
+    mount_point = Path("/") / parts[1] / parts[2]
+    if not os.path.ismount(str(mount_point)):
+        return False, f"target volume is not mounted: {mount_point}"
+    return True, f"external volume {mount_point} is mounted"
+
+
+def _refuse_unsafe_download_root(download_root: Path) -> bool:
+    """True => the download must be REFUSED (and prints why). False => safe."""
+    ok, reason = download_root_is_safe(download_root)
+    if ok:
+        return False
+    try:
+        resolved = Path(download_root).expanduser().resolve()
+    except OSError:
+        resolved = download_root
+    print()
+    print(f"⛔ REFUSING TO DOWNLOAD — {reason}")
+    print(f"   Resolved download root: {resolved}")
+    print("   Models are configured for an external volume (your SSD). To proceed:")
+    print("     • mount the drive, and/or set")
+    print("       MODEL_MANAGER_DOWNLOAD_DIR=<Your Model Directory>")
+    print("     • escape hatch (not recommended): export MODEL_MANAGER_ALLOW_BOOT_DISK=1")
+    return True
+
+
 def final_download_path(result: SearchResult, download_root: Path) -> Path:
     return download_root / ("huggingface" if result.source == "hf" else "kaggle") / result.kind / safe_folder_name(result.repo_id)
 
@@ -4067,21 +4445,24 @@ def describe_partial_download_state(path: Path) -> str:
         return f"partial path exists: {path}"
 
 
-def merge_tree(src: Path, dst: Path) -> None:
+def merge_tree(src: Path, dst: Path) -> list[str]:
+    """ADD-ONLY merge. Per the hard rule that ONLY the user removes or replaces
+    files, this NEVER unlinks, overwrites, or rmdirs anything. It moves in only the
+    files whose destination does not already exist; every existing file is left
+    untouched and returned as a conflict for the user to resolve by hand. The source
+    (staged) tree is left in place — never rmdir'd."""
     dst.mkdir(parents=True, exist_ok=True)
+    conflicts: list[str] = []
     for child in src.iterdir():
         target = dst / child.name
         if child.is_dir():
-            merge_tree(child, target)
+            conflicts.extend(merge_tree(child, target))
+        elif target.exists():
+            conflicts.append(str(target))            # collision → DO NOT overwrite; skip
         else:
             target.parent.mkdir(parents=True, exist_ok=True)
-            if target.exists():
-                target.unlink()
-            shutil.move(str(child), str(target))
-    try:
-        src.rmdir()
-    except OSError:
-        pass
+            shutil.move(str(child), str(target))     # add-only: target did not exist
+    return conflicts
 
 
 def _trees_are_identical_by_size(left: Path, right: Path) -> tuple[bool, str]:
@@ -4151,30 +4532,28 @@ def promote_staged_download(staged: Path, final: Path) -> Path | None:
     print(f"Staged download passed review: {staged}")
     print(f"Final install path: {final}")
     if final.exists():
-        # Auto-merge fast path: if staged and existing-final compare as
-        # byte-size-identical (same files, same sizes), merging is a no-op
-        # in practice — skip the prompt and just unify. Saves the "Y/n
-        # merge?" interruption on re-runs where modelmgr re-downloaded the
-        # same dataset. Disable with MODEL_MANAGER_AUTO_MERGE_IDENTICAL=0
-        # if you want the prompt back.
-        auto_merge = os.environ.get("MODEL_MANAGER_AUTO_MERGE_IDENTICAL", "1").strip().lower() in {"1", "yes", "true", "on"}
-        if auto_merge:
-            identical, reason = _trees_are_identical_by_size(staged, final)
-            if identical:
-                print(f"Staged and existing trees are identical ({reason}). Auto-merging (no-op).")
-                merge_tree(staged, final)
-                print(f"Installed to: {final}")
-                return final
-            else:
-                print(f"Staged and existing trees differ: {reason}")
-                print("Falling back to interactive merge prompt (set MODEL_MANAGER_AUTO_MERGE_IDENTICAL=0 to always prompt).")
-        if not prompt_bool("Final path already exists. Merge staged files into existing final path?", False):
-            print("Keeping staged download in place for manual review.")
+        # HARD RULE: the tool NEVER overwrites, merges-over, deletes, or rmdirs an
+        # existing path — ONLY the user removes/replaces files. So when the final
+        # path already exists we ADD only the non-colliding files, leave every
+        # existing file untouched, keep the staged copy in place, and hand the user
+        # the exact command to resolve it themselves. (This is what cost models
+        # before: the old auto-merge unlinked existing files.)
+        conflicts = merge_tree(staged, final)
+        if conflicts:
+            print(f"  {len(conflicts)} file(s) already exist at the final path and were "
+                  f"NOT overwritten (your decision, not the tool's):")
+            for c in conflicts[:8]:
+                print(f"    - {c}")
+            if len(conflicts) > 8:
+                print(f"    ... and {len(conflicts) - 8} more")
+            print(f"  Staged copy kept in place at: {staged}")
+            print("  To REPLACE the existing copy with the staged one, run it yourself:")
+            print(f"    rm -rf '{final}' && mv '{staged}' '{final}'")
             return staged
-        merge_tree(staged, final)
-    else:
-        final.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(staged), str(final))
+        print(f"Added new (non-colliding) files into existing path; nothing overwritten: {final}")
+        return final
+    final.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(staged), str(final))   # completing the download into a FRESH path (adds only)
     print(f"Installed to: {final}")
     return final
 
@@ -4682,7 +5061,7 @@ def prompt_session_scan_preference(
     choice = prompt_choice(
         "Run security scan after each successful download?",
         ["always", "never", "ask-per-download"],
-        "always",
+        "never",
     )
     if choice == "always":
         set_session_scan_preference(True)
@@ -4863,6 +5242,9 @@ def _resume_one_download(rec: dict) -> None:
         return
     download_root = Path(download_root_str)
     allow_patterns = rec.get("allow_patterns")
+    if _refuse_unsafe_download_root(download_root):
+        print(f"  ✗ skipping resume of {repo_id} — refusing unsafe download root.")
+        return
 
     print()
     print(f"Resuming: {repo_id}")
@@ -5069,9 +5451,14 @@ def download_kaggle_result(result: SearchResult, download_root: Path, allow_patt
             path = Path(fn(result.repo_id))
             if path.exists() and path != target:
                 if path.is_dir():
-                    shutil.copytree(path, target, dirs_exist_ok=True)
+                    # Never overwrite an existing target (rule: only the user replaces
+                    # files). dirs_exist_ok=False fails safe rather than clobbering.
+                    shutil.copytree(path, target, dirs_exist_ok=False)
                 else:
-                    shutil.copy2(path, target / path.name)
+                    if (target / path.name).exists():
+                        print(f"  Target already exists, not overwriting: {target / path.name}")
+                    else:
+                        shutil.copy2(path, target / path.name)
             _clear_active_download(rec_id)
             return target
     except Exception as e:
@@ -5093,9 +5480,12 @@ BUILTIN_MALICIOUS_AI_TERMS = {
 }
 
 BUILTIN_SECURITY_RESEARCH_TERMS = {
+    # Genuine malware / supply-chain risk keywords ONLY. Alignment/content terms
+    # (uncensored, abliterated, obliterated, jailbreak, nsfw, roleplay, erotic) are
+    # deliberately excluded: they are not risk signals and must never trigger a
+    # warning or any gating. The user keeps such models intentionally.
     "poison", "backdoor", "backdoored", "payload", "malware", "ransomware",
-    "credential", "stealer", "phishing", "jailbreak", "bypass", "uncensored",
-    "abliterated", "obliterated", "darkweb", "dark-web",
+    "credential", "stealer", "phishing", "bypass", "darkweb", "dark-web",
 }
 
 
@@ -5660,9 +6050,11 @@ def predownload_risk_and_completeness_check(
         print(f"  This is a large {result.kind}. It will take significant time and disk space.")
         print("  Press Enter or `n` to cancel; type `y` to proceed.")
         print(f"  Adjust threshold via env: {threshold_source} (0 = disable).")
-        if not prompt_bool(f"Proceed with {human_size(size_for_check)} download?", False):
+        if not (is_unattended_mode() or prompt_bool(f"Proceed with {human_size(size_for_check)} download?", False)):
             print("  Skipped (large-download cancellation).")
             return False
+        if is_unattended_mode():
+            print(f"  [unattended] Proceeding with {human_size(size_for_check)} download.")
 
     try:
         total, used, free = shutil.disk_usage(download_root)
@@ -5702,7 +6094,7 @@ def predownload_risk_and_completeness_check(
     for term in sorted(BUILTIN_MALICIOUS_AI_TERMS):
         if normalize_match_text(term) and normalize_match_text(term) in search_blob:
             findings.append({"severity": "DANGER", "message": f"name/artifact matches built-in malicious-AI term: {term}"})
-    for term in sorted(BUILTIN_SECURITY_RESEARCH_TERMS):
+    for term in sorted(BUILTIN_SECURITY_RESEARCH_TERMS - NEVER_WARN_TERMS):
         nt = normalize_match_text(term)
         if nt and nt in search_blob:
             findings.append({"severity": "WARN", "message": f"name/artifact contains risk keyword: {term}"})
@@ -5753,14 +6145,9 @@ def predownload_risk_and_completeness_check(
     else:
         print("Findings: none from metadata/local risk intel.")
 
-    serious = [f for f in findings if f["severity"] in {"DANGER", "BLOCKER"}]
-    if serious:
-        print()
-        print("One or more DANGER/BLOCKER findings were found before download.")
-        return prompt_bool("Download anyway?", False)
-
     if findings:
-        return prompt_bool("Proceed with download despite WARN/INFO findings?", True)
+        print()
+        print("Predownload checks are report-only; continuing with the download.")
     return True
 
 def post_download_audit(result: SearchResult, target: Path, allow_patterns: list[str] | None) -> bool:
@@ -5770,16 +6157,8 @@ def post_download_audit(result: SearchResult, target: Path, allow_patterns: list
     if scanner_findings:
         print_findings(scanner_findings)
     all_findings = findings + scanner_findings
-    offer_delete, reason = should_offer_delete(all_findings)
-    if offer_delete:
-        delete_path_after_confirmation(target, reason)
-        if not target.exists():
-            return False
-        print("Serious finding remains in staged download. Keeping it staged unless you explicitly continue.")
-        return prompt_bool("Install staged download anyway?", False)
     if all_findings:
-        print("No DANGER/BLOCKER findings requiring delete offer; staged files can be installed after review.")
-        return prompt_bool("Install staged download despite WARN/INFO/HIGH findings?", True)
+        print("Post-download checks are report-only; installing the completed download.")
     return True
 
 
@@ -5804,6 +6183,8 @@ def download_selected(results: list[SearchResult], download_root_override: Path 
             print(f"  Using default download root: {download_root}")
         else:
             download_root = Path(raw).expanduser().resolve()
+    if _refuse_unsafe_download_root(download_root):
+        return
     download_root.mkdir(parents=True, exist_ok=True)
     for r in results:
         print()
@@ -6192,16 +6573,22 @@ def filter_and_rank_search_results(
     hide_duplicate_families_pref: bool,
     quiet_family_no_match: bool = False,
     excluded_existing_repo_ids: set[str] | None = None,
+    updated_after: "datetime | None" = None,
+    quant_filter: str | None = None,
 ) -> list[SearchResult]:
     results = merge_search_results(results)
     results = apply_publisher_exclusions(results, excluded_publishers)
     results = apply_term_exclusions(results, excluded_terms)
     if excluded_existing_repo_ids:
         results = apply_existing_repo_exclusions(results, excluded_existing_repo_ids)
+    # Date filter applies to BOTH models and datasets — keep it before the
+    # kind-specific filters so size/artifact filters don't waste work on stale repos.
+    results = filter_results_by_updated_after(results, updated_after)
     if kind in {"models", "both"}:
         results = filter_results_by_artifact_types(results, selected_artifact_types)
         results = filter_results_by_model_size(results, model_size_range)
         results = filter_results_by_multipart_models(results, exclude_multipart_models)
+        results = filter_results_by_quantization(results, quant_filter)
     annotate_results_with_leaderboard_cache(results)
     annotate_recommendations(results)
     results = apply_model_family_exclusions(results, excluded_family_terms, quiet_no_match=quiet_family_no_match)
@@ -6211,7 +6598,7 @@ def filter_and_rank_search_results(
         after = len(results)
         if after < before:
             print(f"Hidden {before - after} likely duplicate/mirror repo(s). Kept strongest candidate per exact variant family.")
-    results.sort(key=lambda r: (r.leaderboard_rank is None, r.leaderboard_rank or 10**9, r.recommendation not in {"KnownGood", "KnownGood/DF", "Leaderboard"}, -(r.downloads or 0), -(r.size_bytes or 0)))
+    results = apply_priority_sort(results)
     assign_indexes(results)
     return results
 
@@ -6244,68 +6631,39 @@ def run_search_flow(options: argparse.Namespace | None = None) -> None:
     )
 
     specific_repo_arg = getattr(options, "specific_repo", None) if options is not None else None
-    if specific_repo_arg or (options is None and prompt_bool("Do you have a specific model to download?", False)):
-        # Collect ONE OR MORE direct repo IDs. The CLI flag --specific-repo
-        # supplies the first; the interactive flow lets the user add more via
-        # a follow-up comma-separated prompt — useful when you've copied a
-        # handful of HF URLs from a tab strip and want to queue them all
-        # without going through the name-search path.
-        repo_ids: list[str] = []
-        first_value = specific_repo_arg or prompt(
-            "Paste Hugging Face repo ID or URL", "")
-        first_repo_id = parse_hf_repo_id(first_value)
+
+    # Specific repos collected via the interactive y/n loop. Injected into
+    # the first iteration of the search loop below as direct_repo_ids so
+    # they get fetched alongside any keyword-search results in one unified
+    # picker (instead of running a separate fetch + picker + download up
+    # front, which the user can't easily augment with search terms).
+    prefetched_specific_repos: list[str] = []
+    # Set True when the user opts to proceed with exactly the queued repos
+    # instead of adding a keyword search; short-circuits the search prompt once.
+    skip_keyword_search = False
+
+    if specific_repo_arg:
+        # CLI scripted path — preserve original behavior: fetch the one
+        # supplied repo, run picker + download, return. No interactive
+        # prompts, no search-loop fall-through.
+        first_repo_id = parse_hf_repo_id(specific_repo_arg)
         if not first_repo_id:
-            print("Could not parse a Hugging Face repo ID. Use owner/name or a huggingface.co URL.")
+            print("Could not parse --specific-repo. Use owner/name or a huggingface.co URL.")
             return
-        repo_ids.append(first_repo_id)
-
-        # Ask whether to queue additional repos. Only in interactive mode —
-        # if --specific-repo was passed via CLI, stick to that single one
-        # so scripted invocations behave predictably.
-        if specific_repo_arg is None:
-            extras = prompt(
-                "Do you have more? If so, comma-separate the remaining "
-                "author/model or URL (Enter to skip)",
-                "",
-            ).strip()
-            if extras:
-                for raw in extras.split(","):
-                    raw = raw.strip()
-                    if not raw:
-                        continue
-                    parsed = parse_hf_repo_id(raw)
-                    if not parsed:
-                        print(f"  ✗ skipping unparseable: {raw!r}")
-                        continue
-                    if parsed in repo_ids:
-                        print(f"  · skipping duplicate: {parsed}")
-                        continue
-                    repo_ids.append(parsed)
-                print(f"Queued {len(repo_ids)} specific repo(s):")
-                for rid in repo_ids:
-                    print(f"  - {rid}")
-
-        kind = getattr(options, "specific_kind", None) if options is not None else None
-        if kind not in {"model", "dataset"}:
-            kind = prompt_choice("Specific item type (applies to all)",
-                                 ["model", "dataset"], "model")
-
-        # Fetch metadata for each. Mark as direct_lookup so the filter chain
-        # doesn't drop any of them on artifact-type/size grounds.
-        results: list[SearchResult] = []
-        for rid in repo_ids:
-            r = build_exact_hf_result(rid, kind=kind)
-            if r is None:
-                print(f"  ✗ direct fetch failed for {rid}")
-                continue
-            r.direct_lookup = True
-            results.append(r)
-        if not results:
-            print("No specific repos could be resolved. Aborting.")
+        kind_arg = getattr(options, "specific_kind", None)
+        kinds_to_try: list[str] = (
+            [kind_arg] if kind_arg in {"model", "dataset"} else ["model", "dataset"]
+        )
+        fetched: SearchResult | None = None
+        for k in kinds_to_try:
+            fetched = build_exact_hf_result(first_repo_id, kind=k)
+            if fetched is not None:
+                break
+        if fetched is None:
+            print(f"  ✗ direct fetch failed for {first_repo_id} (not a valid HF model or dataset)")
             return
-        if len(results) < len(repo_ids):
-            print(f"Resolved {len(results)}/{len(repo_ids)} repos; continuing with what worked.")
-
+        fetched.direct_lookup = True
+        results: list[SearchResult] = [fetched]
         annotate_results_with_leaderboard_cache(results)
         assign_indexes(results)
         print_results_page(results, 0, len(results))
@@ -6318,17 +6676,94 @@ def run_search_flow(options: argparse.Namespace | None = None) -> None:
         download_selected(selected, download_root_override)
         return
 
+    if options is None and prompt_bool("Do you have a single specific model or dataset to download?", False):
+        # Interactive path: loop the same y/n prompt collecting repo IDs.
+        # We DON'T fetch them here — they get injected into the search
+        # loop's first iteration so the user can add keyword terms on top
+        # before everything goes to one unified picker.
+        first_value = prompt("Paste Hugging Face repo ID or URL", "")
+        first_repo_id = parse_hf_repo_id(first_value)
+        if not first_repo_id:
+            print("Could not parse a Hugging Face repo ID. Use owner/name or a huggingface.co URL.")
+            return
+        prefetched_specific_repos.append(first_repo_id)
+        while prompt_bool("Do you have a single specific model or dataset to download?", False):
+            raw = prompt("Paste Hugging Face repo ID or URL", "").strip()
+            if not raw:
+                continue
+            parsed = parse_hf_repo_id(raw)
+            if not parsed:
+                print(f"  ✗ skipping unparseable: {raw!r}")
+                continue
+            if parsed in prefetched_specific_repos:
+                print(f"  · skipping duplicate: {parsed}")
+                continue
+            prefetched_specific_repos.append(parsed)
+            print(f"  + queued {parsed}")
+
+        if len(prefetched_specific_repos) > 1:
+            print(f"Queued {len(prefetched_specific_repos)} specific repo(s):")
+            for i, rid in enumerate(prefetched_specific_repos, 1):
+                print(f"  {i}. {rid}")
+
+        # Optional prune step. This edits ONLY the in-memory queue of repo IDs —
+        # it never deletes, moves, or alters anything on disk.
+        if len(prefetched_specific_repos) > 1 and prompt_bool(
+                "Remove any of these from the list before continuing?", False):
+            while prefetched_specific_repos:
+                for i, rid in enumerate(prefetched_specific_repos, 1):
+                    print(f"  {i}. {rid}")
+                raw = prompt("Number(s) to remove (e.g. 1,3), or Enter to keep the rest", "").strip()
+                if not raw:
+                    break
+                drop = set(parse_selection(raw, len(prefetched_specific_repos)))
+                if not drop:
+                    print("  (nothing matched; queue unchanged)")
+                    continue
+                removed_ids = [rid for idx, rid in enumerate(prefetched_specific_repos, 1) if idx in drop]
+                prefetched_specific_repos[:] = [
+                    rid for idx, rid in enumerate(prefetched_specific_repos, 1) if idx not in drop
+                ]
+                for rid in removed_ids:
+                    print(f"  - removed from list: {rid}")
+
+        if prefetched_specific_repos:
+            print()
+            if prompt_bool(
+                    "Do you want to search for additional models? "
+                    "(y = search for more, n = proceed with the current selections)", False):
+                print("Enter keyword search terms to find more on top of the "
+                      "specific repo(s) above.")
+            else:
+                skip_keyword_search = True
+
+    # One-time opt-in: unattended bulk download. Asked right before the search
+    # terms so a whole batch can run start-to-finish without babysitting each
+    # download (engaged after the user's terms are captured, below).
+    auto_all_downloads = False
+    if options is None and not is_unattended_mode():
+        auto_all_downloads = prompt_bool(
+            "Would you like to proceed with ALL downloads without interaction "
+            "(unattended — no prompts after your search terms)?", False)
+
     while True:
         if options is not None and getattr(options, "search_query", None) is not None:
             query = options.search_query
+        elif skip_keyword_search:
+            # User chose "proceed with current selections" — no name search this pass.
+            query = ""
+            skip_keyword_search = False
         else:
             query = prompt('Search term. Supports OR or commas, e.g. code OR cybersecurity or code, coding', "")
-        if not query:
+        # Empty query is allowed iff we have specific repos queued from the
+        # earlier y/n loop — in that case fall through with no name-search,
+        # just the direct lookups. Otherwise it's still "no query".
+        if not query and not prefetched_specific_repos:
             print("No query entered.")
-            if options is None and prompt_bool("Try another search?", True):
+            if options is None and not is_unattended_mode() and prompt_bool("Try another search?", True):
                 continue
             return
-        raw_terms = split_boolean_query(query)
+        raw_terms = split_boolean_query(query) if query else []
         # Partition into exact repo-ID lookups vs name-based search terms.
         # A term matching `owner/repo` shape is treated as a direct HF lookup
         # (build_exact_hf_result) rather than a substring search — HF's search
@@ -6338,6 +6773,14 @@ def run_search_flow(options: argparse.Namespace | None = None) -> None:
         # the quotes.
         direct_repo_ids: list[str] = []
         search_terms: list[str] = []
+        # Inject any specific repos queued by the y/n loop — they were
+        # deferred so the user could add keyword terms on top. Consume the
+        # list so re-searches in the same session don't re-include them.
+        if prefetched_specific_repos:
+            for rid in prefetched_specific_repos:
+                if rid not in direct_repo_ids:
+                    direct_repo_ids.append(rid)
+            prefetched_specific_repos = []
         for term in raw_terms:
             parsed = parse_hf_repo_id(term)
             if parsed and "/" in parsed:
@@ -6388,6 +6831,7 @@ def run_search_flow(options: argparse.Namespace | None = None) -> None:
         selected_artifact_types: set[str] = set()
         model_size_range: tuple[int | None, int | None] = (None, None)
         exclude_multipart_models = False
+        quant_filter: str | None = None
         if kind in {"models", "both"}:
             selected_from_args = parse_artifact_type_filter_value(getattr(options, "artifact_types", None)) if options is not None else None
             selected_artifact_types = selected_from_args if selected_from_args is not None else choose_artifact_type_filters()
@@ -6398,6 +6842,20 @@ def run_search_flow(options: argparse.Namespace | None = None) -> None:
                 exclude_multipart_models = bool(exclude_multipart_arg)
             elif multipart_artifact_filter_relevant(selected_artifact_types):
                 exclude_multipart_models = prompt_exclude_multipart_models(selected_artifact_types)
+            quant_from_args = parse_quantization_filter_or_default(
+                getattr(options, "quant_filter", None)
+            ) if options is not None else None
+            if quant_from_args is not None:
+                quant_filter = quant_from_args
+            elif options is None:
+                quant_filter = prompt_quantization_filter()
+        # Date filter — applies to BOTH models and datasets. CLI flag takes precedence;
+        # otherwise prompt the user. "any" / empty disables the filter.
+        updated_after_arg = getattr(options, "updated_after", None) if options is not None else None
+        if updated_after_arg is not None:
+            updated_after = parse_updated_after_or_default(updated_after_arg)
+        else:
+            updated_after = prompt_updated_after_date()
         if options is not None and getattr(options, "exclude_publishers", None) is not None:
             excluded_publishers = parse_excluded_publishers_value(options.exclude_publishers)
         else:
@@ -6442,6 +6900,15 @@ def run_search_flow(options: argparse.Namespace | None = None) -> None:
                 excluded_family_terms = parse_model_family_exclusion_terms(options.exclude_families)
             else:
                 excluded_family_terms = prompt_model_family_exclusion_terms()
+
+        # All search options (model type / size / age / source / exclusions) are now
+        # set interactively above. If the user opted into unattended, engage it HERE —
+        # so the SEARCH, selection, review, and downloads run with no further prompts,
+        # but the option choices above were never silently skipped.
+        if auto_all_downloads and not is_unattended_mode():
+            set_unattended_mode(True)
+            print("[unattended] Options set — searching and downloading all matches "
+                  "with no further prompts this session.")
 
         if kind in {"models", "both"}:
             # Expand each base search term independently so the cap is per-base,
@@ -6520,6 +6987,8 @@ def run_search_flow(options: argparse.Namespace | None = None) -> None:
             excluded_family_terms,
             bool(hide_duplicate_families_pref),
             excluded_existing_repo_ids=excluded_existing_repo_ids,
+            updated_after=updated_after,
+            quant_filter=quant_filter,
         )
         debug_log(
             "search-results",
@@ -6578,6 +7047,8 @@ def run_search_flow(options: argparse.Namespace | None = None) -> None:
                     bool(hide_duplicate_families_pref),
                     quiet_family_no_match=True,
                     excluded_existing_repo_ids=excluded_existing_repo_ids,
+                    updated_after=updated_after,
+                    quant_filter=quant_filter,
                 )
                 debug_log(
                     "search-results-deep-scan",
@@ -6597,13 +7068,13 @@ def run_search_flow(options: argparse.Namespace | None = None) -> None:
         if not results:
             print("No results.")
             print("Try a broader term, a different artifact type, or another source.")
-            if options is None and prompt_bool("Search again?", True):
+            if options is None and not is_unattended_mode() and prompt_bool("Search again?", True):
                 continue
             return
         selected = paged_select(results, page_size=page_size)
         if not selected:
             print("No selection.")
-            if options is None and prompt_bool("Start another search?", True):
+            if options is None and not is_unattended_mode() and prompt_bool("Start another search?", True):
                 continue
             return
         offer_local_scan(selected)
@@ -6678,6 +7149,9 @@ def main() -> int:
     ap.add_argument("--search-kind", choices=["models", "datasets", "both"], help="Search for models, datasets, or both")
     ap.add_argument("--artifact-types", help="Model artifact types to include, e.g. gguf,coreml or any")
     ap.add_argument("--model-size-range", help='Model artifact size range, e.g. "200 MB - 2 TB" or any')
+    ap.add_argument("--updated-after", dest="updated_after", default=None,
+                    help='Only return models/datasets updated on or after this date. '
+                         'Relative: 30d, 6w, 6m, 1y. Absolute: 2026-01-01. Use "any" or omit for no filter.')
     ap.add_argument("--exclude-multipart-models", dest="exclude_multipart_models", action="store_true", default=None, help="Hide multi-part model artifacts such as gguf-split or safetensors-sharded")
     ap.add_argument("--include-multipart-models", dest="exclude_multipart_models", action="store_false", help="Allow multi-part model artifacts such as gguf-split or safetensors-sharded")
     ap.add_argument("--exclude-publishers", help="Comma-separated authors/publishers to exclude, or none")
@@ -6800,6 +7274,13 @@ def main() -> int:
             )
             if choice == "search/download":
                 run_search_flow()
+                if is_unattended_mode():
+                    # Unattended is a one-shot batch flag (set by "proceed with ALL
+                    # downloads without interaction") that was never cleared — so the
+                    # menu kept auto-selecting its default "search/download" forever
+                    # (empty query -> "No query entered" -> loop). Clear it so the menu
+                    # reads real input again, or exits cleanly on EOF.
+                    set_unattended_mode(False)
             elif choice == "list unfinished downloads":
                 list_active_downloads_only()
             elif choice == "resume unfinished downloads":

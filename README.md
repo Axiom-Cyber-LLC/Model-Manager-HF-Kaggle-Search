@@ -74,6 +74,22 @@ rm ~/.cache/model_manager/active_downloads.json
 
 ## Recent changes
 
+### 2026-05-31 (dead-CWD guard, ungated-model visibility, boot-disk download guard, scan default, unattended-loop fix)
+
+**`model_manager.py`**
+
+1. **Dead-CWD guard.** If the launch directory has been deleted or unmounted, `os.getcwd()` raises `EPERM`/`ENOENT` and dependencies that call it at import time (e.g. `rich`, pulled in via `huggingface_hub`) crash the whole tool before any work starts. The script now detects a broken CWD at startup and `chdir`s into a known-good directory.
+
+2. **Selection flow.** After entering specific repo IDs, you can now remove any from the list, then choose whether to search for more or proceed with exactly the current selections — instead of always falling through to the keyword-search prompt.
+
+3. **Ungated models stay visible.** Alignment/content terms (`uncensored`, `abliterated`, `jailbreak`, etc.) no longer trigger warnings or any gating. A `NEVER_WARN_TERMS` guard subtracts them from every name-term warn check, so no config (current, regenerated, or hand-edited) can re-introduce an "ungated model" warning. Only genuine tampering terms (`backdoor`, `poisoned`, `eval-bypass`) warn. The "already-downloaded" filter is now opt-in (defaults to no).
+
+4. **Download-root safety guard.** Downloads refuse to write to the boot disk or an unmounted volume — the target must be a mounted external volume — so a misconfigured download dir or an unmounted drive fails loudly instead of silently filling the boot disk. Override with `MODEL_MANAGER_ALLOW_BOOT_DISK=1`.
+
+5. **Security-scan default → never.** The per-session "run external scanners after each download?" prompt now defaults to `never`. Override with `--scan-after-download always` or `MODEL_MANAGER_SCAN_AFTER_DOWNLOAD=always`.
+
+6. **Unattended-mode menu loop fixed.** The unattended batch flag (set by "proceed with ALL downloads without interaction") was never cleared, so after the batch the top menu kept auto-selecting its default and looped. It is now cleared once the batch returns.
+
 ### 2026-05-13 (hfdownloader filter fix + default download root for exclusion prompt)
 
 **`model_manager.py`**
