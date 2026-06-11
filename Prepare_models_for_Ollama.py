@@ -40,7 +40,24 @@ from prepare_models_env import extend_scan_roots
 
 # ── Defaults ──────────────────────────────────────────────────────────
 
-HOME = Path.home()
+def _validated_home() -> Path:
+    """Return the user's home directory after validation (S2083 hardening).
+
+    ``Path.home()`` reads the HOME environment variable, which taint
+    analysis treats as attacker-influenceable. Canonicalize it and require
+    an absolute, NUL-free path with no parent-directory traversal before
+    using it as the root for the Ollama state file this script writes.
+    Operator-chosen homes (including external volumes) stay valid.
+    """
+    resolved = os.path.realpath(os.path.expanduser("~"))
+    if not resolved.startswith(os.sep) or not re.fullmatch(r"/[^\x00]*", resolved):
+        raise SystemExit(f"Refusing unsafe HOME directory: {resolved!r}")
+    if ".." in Path(resolved).parts:
+        raise SystemExit(f"Refusing HOME directory with path traversal: {resolved!r}")
+    return Path(resolved)
+
+
+HOME = _validated_home()
 FLAT_MODELS = Path("<Your Model Directory>/local")
 STATE_FILE = HOME / ".ollama" / "models" / "ai_model_state.json"
 

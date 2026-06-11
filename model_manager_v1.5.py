@@ -64,7 +64,19 @@ PREP_SCRIPT_CANDIDATES = [
 ]
 
 DEFAULT_DOWNLOAD_DIR = Path(os.getenv("MODEL_MANAGER_DOWNLOAD_DIR", str(Path.home() / "model_downloads"))).expanduser().resolve()
-CACHE_DIR = Path(os.getenv("MODEL_MANAGER_CACHE_DIR", str(Path.home() / ".cache" / "model_manager"))).expanduser().resolve()
+def _resolve_trusted_dir(env_var: str, default: str) -> Path:
+    """S2083 hardening: canonicalize an env-supplied directory root and require
+    an absolute, NUL-free path with no residual parent-directory traversal."""
+    raw = (os.getenv(env_var) or "").strip() or default
+    resolved = os.path.realpath(os.path.expanduser(raw))
+    if not resolved.startswith(os.sep) or not re.fullmatch(r"/[^\x00]*", resolved):
+        raise SystemExit(f"{env_var}: refusing unsafe directory path {raw!r}")
+    if ".." in Path(resolved).parts:
+        raise SystemExit(f"{env_var}: refusing path traversal in {raw!r}")
+    return Path(resolved)
+
+
+CACHE_DIR = _resolve_trusted_dir("MODEL_MANAGER_CACHE_DIR", str(Path.home() / ".cache" / "model_manager"))
 LEADERBOARD_CACHE_PATH = CACHE_DIR / "leaderboard_cache.json"
 MODEL_MANAGER_VERSION = "v1.5"
 MODEL_FILE_EXTENSIONS = {".gguf", ".safetensors", ".bin", ".pt", ".pth", ".ckpt", ".onnx", ".mlmodel"}
