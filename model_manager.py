@@ -152,7 +152,27 @@ def _default_incoming_dir(download_dir: Path) -> Path:
 INCOMING_DOWNLOAD_DIR = Path(
     os.getenv("MODEL_MANAGER_INCOMING_DIR", str(_default_incoming_dir(DEFAULT_DOWNLOAD_DIR)))
 ).expanduser().resolve()
-CACHE_DIR = Path(os.getenv("MODEL_MANAGER_CACHE_DIR", str(Path.home() / ".cache" / "model_manager"))).expanduser().resolve()
+def _resolve_trusted_dir(env_var: str, default: str) -> Path:
+    """Resolve a directory root taken from the environment (S2083 hardening).
+
+    Environment variables (including HOME, which feeds ``Path.home()``) are
+    tainted input to taint analysis. This is an operator CLI tool, so any
+    absolute directory the operator names is a legitimate root (external
+    volumes included) — the value is deliberately not pinned under a fixed
+    base. Instead it is canonicalized with ``os.path.realpath`` (eliminating
+    ``..`` traversal and symlink tricks) and must match an allowlist: an
+    absolute, NUL-free path with no residual parent-directory segments.
+    """
+    raw = (os.getenv(env_var) or "").strip() or default
+    resolved = os.path.realpath(os.path.expanduser(raw))
+    if not resolved.startswith(os.sep) or not re.fullmatch(r"/[^\x00]*", resolved):
+        raise SystemExit(f"{env_var}: refusing unsafe directory path {raw!r}")
+    if ".." in Path(resolved).parts:
+        raise SystemExit(f"{env_var}: refusing path traversal in {raw!r}")
+    return Path(resolved)
+
+
+CACHE_DIR = _resolve_trusted_dir("MODEL_MANAGER_CACHE_DIR", str(Path.home() / ".cache" / "model_manager"))
 LEADERBOARD_CACHE_PATH = CACHE_DIR / "leaderboard_cache.json"
 REPUTATION_CACHE_PATH = CACHE_DIR / "publisher_reputation.json"
 # Persisted in-flight download queue. Records get added before each download

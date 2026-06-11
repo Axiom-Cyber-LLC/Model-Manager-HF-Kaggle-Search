@@ -135,7 +135,26 @@ HF_CACHE_DIRS = extend_scan_roots(_hf_cache_dirs_from_env() + [
 ])
 # Backward-compat alias — kept for code paths that referenced the singular name.
 HF_CACHE_DIR = HF_CACHE_DIRS[0]
-OLLAMA_STATE_FILE = Path.home() / ".ollama" / "models" / "model_state.json"
+
+
+def _validated_home() -> Path:
+    """Return the user's home directory after validation (S2083 hardening).
+
+    ``Path.home()`` reads the HOME environment variable, which taint
+    analysis treats as attacker-influenceable. Canonicalize it and require
+    an absolute, NUL-free path with no parent-directory traversal before
+    using it as the root for the Ollama state file this script writes.
+    Operator-chosen homes (including external volumes) stay valid.
+    """
+    resolved = os.path.realpath(os.path.expanduser("~"))
+    if not resolved.startswith(os.sep) or not re.fullmatch(r"/[^\x00]*", resolved):
+        raise SystemExit(f"Refusing unsafe HOME directory: {resolved!r}")
+    if ".." in Path(resolved).parts:
+        raise SystemExit(f"Refusing HOME directory with path traversal: {resolved!r}")
+    return Path(resolved)
+
+
+OLLAMA_STATE_FILE = _validated_home() / ".ollama" / "models" / "model_state.json"
 
 
 def _detect_lmstudio_downloads_folder() -> Path:

@@ -9,3 +9,14 @@ openpyxl>=3.1.0
 pandas>=2.0.0
 pyarrow>=15.0.0
 safetensors>=0.4.0
+
+# Security floors for transitive dependencies (Snyk findings).
+# These are not imported directly; the floors force resolution to patched
+# releases (urllib3/requests/idna via kaggle + huggingface_hub, protobuf via
+# the kaggle/pyarrow toolchain, setuptools/zipp via the packaging stack).
+idna>=3.11
+protobuf>=4.25.8
+requests>=2.33.0
+setuptools>=78.1.1
+urllib3>=2.7.0
+zipp>=3.19.1
